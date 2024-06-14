@@ -72,9 +72,11 @@ executable hwarden
     , aeson
     , base            ^>=4.18.2.1
     , bytestring
+    , http-client
     , servant-client
     , servant-server
     , text
+    , turtle
     , warp
 
   -- Directories containing source files.
