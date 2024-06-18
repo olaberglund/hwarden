@@ -72,6 +72,7 @@ executable hwarden
     , aeson
     , base            ^>=4.18.2.1
     , bytestring
+    , containers
     , http-client
     , servant-client
     , servant-server

@@ -7,40 +7,47 @@
 
 module Main where
 
-import           Control.Monad        (void, (>=>))
-import           Data.Aeson           (FromJSON (parseJSON), ToJSON (toJSON),
-                                       decode, object, withObject, withText,
-                                       (.:), (.=))
-import qualified Data.ByteString.Lazy as LBS
-import           Data.Coerce          (coerce)
-import           Data.List            (intersperse, sort)
-import           Data.List.NonEmpty   (NonEmpty)
-import qualified Data.List.NonEmpty   as NonEmpty
-import           Data.Maybe           (fromMaybe, mapMaybe)
-import           Data.Ord             (comparing)
-import           Data.Text            (Text)
-import qualified Data.Text            as Text
-import           GHC.Generics         (Generic)
-import           Network.HTTP.Client  (defaultManagerSettings, newManager)
-import           Prelude              hiding (log)
-import           Servant              (Get, JSON, NamedRoutes, Post,
-                                       PostNoContent, Proxy (Proxy), ReqBody,
-                                       (:-), (:>))
-import           Servant.Client       (AsClientT, ClientEnv, ClientError (..),
-                                       ClientM, Response, client, mkClientEnv,
-                                       parseBaseUrl, responseBody, runClientM,
-                                       (//))
-import           Turtle               (Line, MonadIO (liftIO), Shell, UTCTime,
-                                       die, inproc, lineToText, select, sh,
-                                       textToLine, textToLines)
+import           Data.Aeson          (FromJSON (parseJSON), ToJSON (toJSON),
+                                      decode, object, withObject, withText,
+                                      (.:), (.=))
+import           Data.Coerce         (coerce)
+import           Data.List           (intersperse, sort)
+import           Data.List.NonEmpty  (NonEmpty)
+import qualified Data.List.NonEmpty  as NonEmpty
+import qualified Data.Map            as Map
+import           Data.Maybe          (fromMaybe, mapMaybe)
+import           Data.Ord            (comparing)
+import           Data.Text           (Text)
+import qualified Data.Text           as Text
+import           GHC.Generics        (Generic)
+import           Network.HTTP.Client (defaultManagerSettings, newManager)
+import           Prelude             hiding (log)
+import           Servant             (Get, JSON, NamedRoutes, Post,
+                                      PostNoContent, Proxy (Proxy), ReqBody,
+                                      (:-), (:>))
+import           Servant.Client      (AsClientT, ClientEnv, ClientError (..),
+                                      ClientM, Response, client, mkClientEnv,
+                                      parseBaseUrl, responseBody, runClientM,
+                                      (//))
+import           Turtle              (Line, MonadIO (liftIO), Shell, UTCTime,
+                                      die, inproc, lineToText, select, sh,
+                                      textToLine, textToLines, unsafeTextToLine,
+                                      void, when, (>=>))
 
 default (Text)
 
 class ToLine a where
     toLine :: a -> Line
 
-dmenuSelect :: [Text.Text] -> NonEmpty Line -> Shell Line
-dmenuSelect args ls = inproc "dmenu" (["-l", Text.pack (show (length ls))] <> args) (select ls)
+dmenuSelect :: [Text.Text] -> Text -> NonEmpty Line -> Shell Line
+dmenuSelect args p ls = inproc "dmenu" (["-l", Text.pack (show (maxOr 24 (length ls))), "-p", p] <> args) (select ls)
+
+maxOr :: (Ord a) => a -> a -> a
+maxOr a b = if b > a then a else b
+
+-- | Copy the given line to the clipboard
+copyToClipboard :: Line -> Shell ()
+copyToClipboard = void . inproc "xsel" ["-ib", "-t", "30000"] . pure
 
 main :: IO ()
 main = do
@@ -49,31 +56,43 @@ main = do
     let env = mkClientEnv manager baseUrl
     sh $ do
         status <- getStatus env
-        case statusDataStatus status of
-            Locked -> do
-                _pw <- askPassword
-                _ <- login env (Password "")
-                die "Logged in"
-            Unlocked -> do
-                items <- sort <$> getItems env
-                let options = NonEmpty.fromList $ map toLine items <> otherActions
-                selected <- dmenuSelect [] options
-                liftIO $ print selected
 
-data MetaAction = Cancel | LogOut
+        when (statusDataStatus status == Locked) $
+            void $
+                askPassword >> login env (Password "qweqweqweqwe")
+
+        items <- sort . concat . replicate 10 <$> getItems env
+        let widest = length (show (length items))
+        let toEntry (i, item) = unsafeTextToLine (Text.pack (replicate (widest - length (show i)) ' ' <> show i <> ". ")) <> toLine item
+        let items' = [toEntry e | e <- [1 :: Int ..] `zip` items]
+        let options = NonEmpty.fromList $ otherActions <> items'
+        selected <- dmenuSelect [] "Entries" options
+        case parseAction (lineToText selected) of
+            Nothing     -> copyToClipboard selected
+            Just Sync   -> die "YO"
+            Just LogOut -> logout env >> die "Logged out"
+
+parseAction :: Text -> Maybe Action
+parseAction = flip Map.lookup actions
+  where
+    actions :: Map.Map Text Action
+    actions =
+        Map.fromList $
+            zip (map (lineToText . toLine @Action) [minBound ..]) [minBound ..]
+
+data Action = Sync | LogOut
     deriving stock (Show, Eq, Enum, Bounded)
 
-instance ToLine MetaAction where
-    toLine = \case
-        LogOut -> "Lock vault"
-        Cancel -> "Cancel"
+instance ToLine Action where
+    toLine LogOut = "Lock Vault"
+    toLine Sync   = "Sync"
 
 otherActions :: [Line]
-otherActions = map toLine [minBound :: MetaAction ..]
+otherActions = map (toLine @Action) [minBound ..]
 
 handleClientError :: ClientError -> Shell a
 handleClientError clientError = case clientError of
-    (DecodeFailure df _)           -> announce "Decode failure" >> die df
+    (DecodeFailure df _)           -> dmenuShow "Decode failure" >> die df
     (ConnectionError _)            -> logId "Connection error"
     (UnsupportedContentType _ res) -> log "Unsupported content type" res
     (InvalidContentTypeHeader res) -> log "Invalid content type header" res
@@ -87,13 +106,10 @@ handleClientError clientError = case clientError of
             . responseBody
 
     logId :: Text -> Shell a
-    logId err = announce err >> die err
+    logId err = dmenuShow err >> die err
 
     log :: Text -> Response -> Shell a
-    log err full = announce err >> die (err <> ":" <> tshow' (responseBody full))
-
-tshow' :: LBS.ByteString -> Text
-tshow' = Text.pack . show
+    log err full = dmenuShow err >> die (err <> ":" <> Text.pack (show (responseBody full)))
 
 askPassword :: Shell Password
 askPassword = Password . lineToText <$> inproc "dmenu" args ""
@@ -103,42 +119,31 @@ askPassword = Password . lineToText <$> inproc "dmenu" args ""
 
 login :: ClientEnv -> Password -> Shell UnlockData
 login env pw =
-    liftIO (runClientM (unlock pw) env) >>= \case
-        Left e -> handleClientError e
-        Right (VaultResponse res) ->
-            announce (unlockDataTitle res)
-                >> pure res
+    callApi (unlock pw) env >>= \res ->
+        dmenuShow (unlockDataTitle res)
+            >> pure res
   where
     unlock = vaultClient // lockingEp // unlockEp
 
-logout :: ClientEnv -> Shell LockData
-logout env =
-    liftIO (runClientM lock env) >>= \case
-        Left e -> handleClientError e
-        Right (VaultResponse res) ->
-            announce (unLockDataTitle res)
-                >> pure res
+logout :: ClientEnv -> Shell ()
+logout env = callApi lock env >>= \res -> dmenuShow (unLockDataTitle res)
   where
     lock = vaultClient // lockingEp // lockEp
 
 getItems :: ClientEnv -> Shell [ItemTemplate]
-getItems env =
-    liftIO (runClientM items env) >>= \case
-        Left e -> handleClientError e
-        Right (VaultResponse res) -> pure (coerce res)
-  where
-    items = vaultClient // itemsEp // getItemsEp
+getItems = coerce . callApi (vaultClient // itemsEp // getItemsEp)
 
 getStatus :: ClientEnv -> Shell StatusData
-getStatus env =
-    liftIO (runClientM status env) >>= \case
+getStatus = callApi (vaultClient // miscEp // statusEp)
+
+callApi :: ClientM (VaultResponse b) -> ClientEnv -> Shell b
+callApi action env =
+    liftIO (runClientM action env) >>= \case
         Left e -> handleClientError e
         Right (VaultResponse res) -> pure res
-  where
-    status = vaultClient // miscEp // statusEp
 
-announce :: Text -> Shell ()
-announce msg = void $ dmenuSelect [] (textToLines msg)
+dmenuShow :: Text -> Shell ()
+dmenuShow msg = void $ dmenuSelect [] "" (textToLines msg)
 
 type Todo = PostNoContent
 
@@ -167,7 +172,8 @@ newtype VaultFailureResponse = VaultFailureResponse
     deriving stock (Show, Eq)
 
 instance FromJSON VaultFailureResponse where
-    parseJSON = withObject "VaultFailureResponse" $ \o -> VaultFailureResponse <$> o .: "message"
+    parseJSON = withObject "VaultFailureResponse" $ \o ->
+        VaultFailureResponse <$> o .: "message"
 
 instance (FromJSON a) => FromJSON (VaultResponse a) where
     parseJSON = withObject "VaultResponse" $ \o -> do
@@ -265,17 +271,19 @@ data Item
 
 toEmoji :: Item -> Text
 toEmoji = \case
-    ItemLogin _ -> "🔐"
-    ItemCard _ -> "💳"
-    ItemIdentity _ -> "👤"
-    ItemSecureNote _ -> "🗒️"
+    ItemLogin _ -> "(l)"
+    ItemCard _ -> "(c)"
+    ItemIdentity _ -> "(i)"
+    ItemSecureNote _ -> "(s)"
 
 instance ToLine ItemTemplate where
-    toLine (ItemTemplate _ name _ item) = merge $ mapMaybe textToLine $ mappend [toEmoji item, name] $ case item of
-        ItemLogin Login{..} -> [loginUsername] <> map unUri loginUris
-        ItemCard Card{..}   -> [Text.take 5 cardNumber <> "..."]
-        ItemIdentity _      -> ["Identity"]
-        ItemSecureNote _    -> ["Secure Note"]
+    toLine (ItemTemplate _ name _ item) = merge $
+        mapMaybe textToLine $
+            mappend [toEmoji item, name] $ case item of
+                ItemLogin Login{..} -> [loginUsername] <> map unUri loginUris
+                ItemCard Card{..}   -> [Text.take 5 cardNumber <> "..."]
+                ItemIdentity _      -> ["Identity"]
+                ItemSecureNote _    -> ["Secure Note"]
 
 merge :: [Line] -> Line
 merge = mconcat . intersperse " - "
