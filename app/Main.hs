@@ -40,12 +40,8 @@ class ToLine a where
     toLine :: a -> Line
 
 dmenuSelect :: [Text.Text] -> Text -> NonEmpty Line -> Shell Line
-dmenuSelect args p ls = inproc "dmenu" (["-l", Text.pack (show (maxOr 24 (length ls))), "-p", p] <> args) (select ls)
+dmenuSelect args p ls = inproc "dmenu" (["-l", Text.pack (show (min 24 (length ls))), "-p", p] <> args) (select ls)
 
-maxOr :: (Ord a) => a -> a -> a
-maxOr a b = if b > a then a else b
-
--- | Copy the given line to the clipboard
 copyToClipboard :: Line -> Shell ()
 copyToClipboard = void . inproc "xsel" ["-ib", "-t", "30000"] . pure
 
@@ -73,7 +69,7 @@ main = do
             Just LogOut -> logout env >> die "Logged out"
 
 parseAction :: Text -> Maybe Action
-parseAction = flip Map.lookup actions
+parseAction = (`Map.lookup` actions)
   where
     actions :: Map.Map Text Action
     actions =
@@ -90,13 +86,20 @@ instance ToLine Action where
 otherActions :: [Line]
 otherActions = map (toLine @Action) [minBound ..]
 
+{-
+Handle errors that can occur when making requests to the vault server.
+It will display a message in dmenu and print the error message to the console
+and then exit the program.
+-}
 handleClientError :: ClientError -> Shell a
-handleClientError clientError = case clientError of
-    (DecodeFailure df _)           -> dmenuShow "Decode failure" >> die df
-    (ConnectionError _)            -> logId "Connection error"
-    (UnsupportedContentType _ res) -> log "Unsupported content type" res
-    (InvalidContentTypeHeader res) -> log "Invalid content type header" res
-    (FailureResponse _ res)        -> logId (reason res)
+handleClientError clientError =
+    case clientError of
+        (DecodeFailure df _)           -> dmenuShow "Decode failure" >> pure df
+        (ConnectionError _)            -> logId "Connection error"
+        (UnsupportedContentType _ res) -> log "Unsupported content type" res
+        (InvalidContentTypeHeader res) -> log "Invalid content type header" res
+        (FailureResponse _ res)        -> logId (reason res)
+        >>= die
   where
     reason :: Response -> Text
     reason =
@@ -105,11 +108,11 @@ handleClientError clientError = case clientError of
             . decode @VaultFailureResponse
             . responseBody
 
-    logId :: Text -> Shell a
-    logId err = dmenuShow err >> die err
+    logId :: Text -> Shell Text
+    logId err = dmenuShow err >> pure err
 
-    log :: Text -> Response -> Shell a
-    log err full = dmenuShow err >> die (err <> ":" <> Text.pack (show (responseBody full)))
+    log :: Text -> Response -> Shell Text
+    log err full = dmenuShow err >> pure (err <> ":" <> Text.pack (show (responseBody full)))
 
 askPassword :: Shell Password
 askPassword = Password . lineToText <$> inproc "dmenu" args ""
