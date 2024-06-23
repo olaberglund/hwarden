@@ -1,4 +1,5 @@
 {-# LANGUAGE DataKinds            #-}
+{-# LANGUAGE DeriveAnyClass       #-}
 {-# LANGUAGE DerivingStrategies   #-}
 {-# LANGUAGE ExtendedDefaultRules #-}
 {-# LANGUAGE LambdaCase           #-}
@@ -19,6 +20,7 @@ import           Data.Maybe          (fromMaybe, mapMaybe)
 import           Data.Ord            (comparing)
 import           Data.Text           (Text)
 import qualified Data.Text           as Text
+import qualified Data.Text.IO
 import           GHC.Generics        (Generic)
 import           Network.HTTP.Client (defaultManagerSettings, newManager)
 import           Prelude             hiding (log)
@@ -29,10 +31,11 @@ import           Servant.Client      (AsClientT, ClientEnv, ClientError (..),
                                       ClientM, Response, client, mkClientEnv,
                                       parseBaseUrl, responseBody, runClientM,
                                       (//))
-import           Turtle              (Line, MonadIO (liftIO), Shell, UTCTime,
-                                      die, inproc, lineToText, select, sh,
-                                      textToLine, textToLines, unsafeTextToLine,
-                                      void, when, (>=>))
+import           Turtle              (IsString (fromString), Line,
+                                      MonadIO (liftIO), Shell, UTCTime, die,
+                                      inproc, lineToText, linesToText, select,
+                                      sh, textToLine, textToLines,
+                                      unsafeTextToLine, void, when, (>=>))
 
 default (Text)
 
@@ -40,51 +43,97 @@ class ToLine a where
     toLine :: a -> Line
 
 dmenuSelect :: [Text.Text] -> Text -> NonEmpty Line -> Shell Line
-dmenuSelect args p ls = inproc "dmenu" (["-l", Text.pack (show (min 24 (length ls))), "-p", p] <> args) (select ls)
-
-copyToClipboard :: Line -> Shell ()
-copyToClipboard = void . inproc "xsel" ["-ib", "-t", "30000"] . pure
+dmenuSelect args p ls = inproc "dmenu" (["-i", "-l", Text.pack (show (min 24 (length ls))), "-p", p] <> args) (select ls)
 
 main :: IO ()
 main = do
+    [pass] <- Text.lines <$> Data.Text.IO.readFile ".env.development"
     manager <- newManager defaultManagerSettings
     baseUrl <- parseBaseUrl "http://localhost:8087"
     let env = mkClientEnv manager baseUrl
     sh $ do
-        status <- getStatus env
+        -- status <- getStatus env
+        --
+        -- when (statusDataStatus status == Locked) $
+        --     void $
+        --         askPassword >> login env (Password pass)
 
-        when (statusDataStatus status == Locked) $
-            void $
-                askPassword >> login env (Password "qweqweqweqwe")
+        items <- getItemsMock env
 
-        items <- sort . concat . replicate 10 <$> getItems env
         let widest = length (show (length items))
         let toEntry (i, item) = unsafeTextToLine (Text.pack (replicate (widest - length (show i)) ' ' <> show i <> ". ")) <> toLine item
         let items' = [toEntry e | e <- [1 :: Int ..] `zip` items]
+        let fromEntry = (items !!) . subtract 1 . read . Text.unpack . head . Text.splitOn "." . lineToText
+
         let options = NonEmpty.fromList $ otherActions <> items'
         selected <- dmenuSelect [] "Entries" options
-        case parseAction (lineToText selected) of
-            Nothing     -> copyToClipboard selected
-            Just Sync   -> die "YO"
-            Just LogOut -> logout env >> die "Logged out"
 
-parseAction :: Text -> Maybe Action
-parseAction = (`Map.lookup` actions)
+        case parseVaultAction (lineToText selected) of
+            _ -> undefined
+
+--            Just Sync   -> die "Synced"
+--            Just LogOut -> die "Logged out" -- logout env >> die "Logged out"
+--            Nothing     -> presentItemOptions (fromEntry selected)
+
+presentItemOptions :: ItemTemplate -> Shell Line
+presentItemOptions = dmenuSelect [] "" . NonEmpty.fromList . ("Back" :) . map toLine . itemOptions
+
+paste :: Text -> Shell ()
+paste text = void $ inproc "xdotool" ["type", text] ""
+
+performItemAction :: ItemAction -> Shell ()
+performItemAction (Paste _ info) = paste info
+
+itemOptions :: ItemTemplate -> [ItemAction]
+itemOptions it = case itItem it of
+    ItemLogin (Login _ name pw) -> [Paste "username" name, Paste "password" pw]
+    ItemCard (Card _ number code) -> [Paste "card number" number, Paste "CSV" code]
+    ItemSecureNote (SecureNote note) -> [Paste "note" (Text.pack $ show note)]
+    ItemIdentity _ident -> []
+
+data View = DashboardView [VaultAction] [ItemTemplate] | ItemView ItemTemplate
+
+presentOptions :: View -> Shell Line
+presentOptions (DashboardView actions items) = dmenuSelect [] "Entries" options
+
+parseVaultAction :: Text -> Maybe VaultAction
+parseVaultAction = (`Map.lookup` actions)
   where
-    actions :: Map.Map Text Action
+    actions :: Map.Map Text VaultAction
     actions =
         Map.fromList $
-            zip (map (lineToText . toLine @Action) [minBound ..]) [minBound ..]
+            zip (map (lineToText . toLine @VaultAction) [minBound ..]) [minBound ..]
 
-data Action = Sync | LogOut
+data MetaAction = Back
+    deriving stock (Show, Eq)
+
+instance ToLine MetaAction where
+    toLine Back = "Back"
+
+data VaultAction = Sync | LogOut
     deriving stock (Show, Eq, Enum, Bounded)
 
-instance ToLine Action where
+instance ToLine VaultAction where
     toLine LogOut = "Lock Vault"
     toLine Sync   = "Sync"
 
+data ItemAction = Paste Label Text
+    deriving stock (Show, Eq)
+
+instance ToLine ItemAction where
+    toLine (Paste lbl _) = "Paste " <> unsafeTextToLine (unLabel lbl)
+
+newtype Label = Label {unLabel :: Text}
+    deriving stock (Show, Eq)
+
+instance IsString Label where
+    fromString = Label . Text.pack
+
+data Action = Meta MetaAction | Vault VaultAction | Item ItemAction
+    deriving stock (Show, Eq)
+
 otherActions :: [Line]
-otherActions = map (toLine @Action) [minBound ..]
+otherActions = map (toLine @VaultAction) [minBound ..]
 
 {-
 Handle errors that can occur when making requests to the vault server.
@@ -135,6 +184,30 @@ logout env = callApi lock env >>= \res -> dmenuShow (unLockDataTitle res)
 
 getItems :: ClientEnv -> Shell [ItemTemplate]
 getItems = coerce . callApi (vaultClient // itemsEp // getItemsEp)
+
+getItemsMock :: ClientEnv -> Shell [ItemTemplate]
+getItemsMock _ =
+    pure $
+        map
+            ( ( \i ->
+                    ItemTemplate
+                        { itfolderId = Just $ "folder " <> i
+                        , itName = "name " <> i
+                        , itNotes = Just $ "note " <> i
+                        , itItem =
+                            ItemLogin
+                                ( Login
+                                    { loginUris = [Uri $ "https://somthing.se/" <> i]
+                                    , loginUsername = "username " <> i
+                                    , loginPassword = "password " <> i
+                                    }
+                                )
+                        }
+              )
+                . Text.pack
+                . show @Int
+            )
+            [1 .. 30]
 
 getStatus :: ClientEnv -> Shell StatusData
 getStatus = callApi (vaultClient // miscEp // statusEp)
@@ -304,7 +377,7 @@ data ItemTemplate = ItemTemplate
     deriving (Show, Eq)
 
 instance Ord ItemTemplate where
-    compare = comparing itItem
+    compare = comparing itItem <> comparing itName
 
 newtype Uri = Uri
     { unUri :: Text
