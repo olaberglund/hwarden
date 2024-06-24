@@ -10,13 +10,13 @@ module Main where
 
 import           Data.Aeson          (FromJSON (parseJSON), ToJSON (toJSON),
                                       decode, object, withObject, withText,
-                                      (.:), (.=))
+                                      (.:), (.:?), (.=))
 import           Data.Coerce         (coerce)
 import           Data.List           (intersperse, sort)
 import           Data.List.NonEmpty  (NonEmpty)
 import qualified Data.List.NonEmpty  as NonEmpty
 import qualified Data.Map            as Map
-import           Data.Maybe          (fromMaybe, mapMaybe)
+import           Data.Maybe          (catMaybes, fromMaybe, mapMaybe)
 import           Data.Ord            (comparing)
 import           Data.Text           (Text)
 import qualified Data.Text           as Text
@@ -33,9 +33,9 @@ import           Servant.Client      (AsClientT, ClientEnv, ClientError (..),
                                       (//))
 import           Turtle              (IsString (fromString), Line,
                                       MonadIO (liftIO), Shell, UTCTime, die,
-                                      inproc, lineToText, linesToText, select,
-                                      sh, textToLine, textToLines,
-                                      unsafeTextToLine, void, when, (>=>))
+                                      inproc, lineToText, select, sh,
+                                      textToLine, textToLines, unsafeTextToLine,
+                                      void, when, (>=>))
 
 default (Text)
 
@@ -47,33 +47,19 @@ dmenuSelect args p ls = inproc "dmenu" (["-i", "-l", Text.pack (show (min 24 (le
 
 main :: IO ()
 main = do
-    [pass] <- Text.lines <$> Data.Text.IO.readFile ".env.development"
+    -- [pass] <- Text.lines <$> Data.Text.IO.readFile ".env.development"
     manager <- newManager defaultManagerSettings
     baseUrl <- parseBaseUrl "http://localhost:8087"
     let env = mkClientEnv manager baseUrl
     sh $ do
-        -- status <- getStatus env
-        --
-        -- when (statusDataStatus status == Locked) $
-        --     void $
-        --         askPassword >> login env (Password pass)
+        status <- getStatus env
 
-        items <- getItemsMock env
+        when (statusDataStatus status == Locked) $
+            void $
+                askPassword >>= login env
 
-        let widest = length (show (length items))
-        let toEntry (i, item) = unsafeTextToLine (Text.pack (replicate (widest - length (show i)) ' ' <> show i <> ". ")) <> toLine item
-        let items' = [toEntry e | e <- [1 :: Int ..] `zip` items]
-        let fromEntry = (items !!) . subtract 1 . read . Text.unpack . head . Text.splitOn "." . lineToText
-
-        let options = NonEmpty.fromList $ otherActions <> items'
-        selected <- dmenuSelect [] "Entries" options
-
-        case parseVaultAction (lineToText selected) of
-            _ -> undefined
-
---            Just Sync   -> die "Synced"
---            Just LogOut -> die "Logged out" -- logout env >> die "Logged out"
---            Nothing     -> presentItemOptions (fromEntry selected)
+        items <- getItems env
+        handleView (DashboardView [Sync, LogOut] items)
 
 presentItemOptions :: ItemTemplate -> Shell Line
 presentItemOptions = dmenuSelect [] "" . NonEmpty.fromList . ("Back" :) . map toLine . itemOptions
@@ -81,28 +67,65 @@ presentItemOptions = dmenuSelect [] "" . NonEmpty.fromList . ("Back" :) . map to
 paste :: Text -> Shell ()
 paste text = void $ inproc "xdotool" ["type", text] ""
 
-performItemAction :: ItemAction -> Shell ()
-performItemAction (Paste _ info) = paste info
-
 itemOptions :: ItemTemplate -> [ItemAction]
 itemOptions it = case itItem it of
-    ItemLogin (Login _ name pw) -> [Paste "username" name, Paste "password" pw]
-    ItemCard (Card _ number code) -> [Paste "card number" number, Paste "CSV" code]
-    ItemSecureNote (SecureNote note) -> [Paste "note" (Text.pack $ show note)]
+    ItemLogin (Login _ name pw) ->
+        catMaybes
+            [ ItemAction <$> fmap ("Username: " <>) name <*> fmap paste name
+            , ItemAction "Password: ********" . paste <$> pw
+            ]
+    ItemCard (Card _ number code) ->
+        [ ItemAction ("Number: " <> number) (paste number)
+        , ItemAction ("CVV: " <> code) (paste code)
+        ]
+    ItemSecureNote (SecureNote _note) -> undefined
     ItemIdentity _ident -> []
 
 data View = DashboardView [VaultAction] [ItemTemplate] | ItemView ItemTemplate
 
-presentOptions :: View -> Shell Line
-presentOptions (DashboardView actions items) = dmenuSelect [] "Entries" options
-
-parseVaultAction :: Text -> Maybe VaultAction
-parseVaultAction = (`Map.lookup` actions)
+handleDashboardView :: [VaultAction] -> [ItemTemplate] -> Shell ()
+handleDashboardView actions items = do
+    let entries' = entries items
+    selected <- dmenuSelect [] "Entries" (NonEmpty.fromList (map toLine actions <> Map.keys entries'))
+    case parseVaultAction (lineToText selected) of
+        Just Sync   -> die "Synced"
+        Just LogOut -> die "Logged out"
+        Nothing     -> handleView (ItemView (entries' Map.! selected))
   where
-    actions :: Map.Map Text VaultAction
-    actions =
-        Map.fromList $
-            zip (map (lineToText . toLine @VaultAction) [minBound ..]) [minBound ..]
+    parseVaultAction :: Text -> Maybe VaultAction
+    parseVaultAction = (`Map.lookup` actions')
+      where
+        actions' :: Map.Map Text VaultAction
+        actions' =
+            Map.fromList $
+                zip (map (lineToText . toLine @VaultAction) [minBound ..]) [minBound ..]
+
+    entries :: (ToLine a) => [a] -> Map.Map Line a
+    entries xs = Map.fromList [(toEntry (i, x), x) | (i, x) <- [1 :: Int ..] `zip` xs]
+      where
+        toEntry :: (Show a) => (ToLine b) => (a, b) -> Line
+        toEntry (i, x) =
+            unsafeTextToLine
+                (Text.pack (replicate (width xs - length (show i)) ' ' <> show i <> ". "))
+                <> toLine x
+
+        width :: [a] -> Int
+        width = length . show . length
+
+handleView :: View -> Shell ()
+handleView = \case
+    DashboardView actions items -> handleDashboardView actions items
+    ItemView item -> handleItemView item
+
+handleItemView :: ItemTemplate -> Shell ()
+handleItemView item =
+    dmenuSelect [] (itName item) options
+        >>= itemActionRun . (entries Map.!)
+  where
+    options = NonEmpty.fromList (Map.keys entries)
+    entries =
+        let opts = itemOptions item
+         in (Map.fromList . zip (map toLine opts)) opts
 
 data MetaAction = Back
     deriving stock (Show, Eq)
@@ -117,11 +140,13 @@ instance ToLine VaultAction where
     toLine LogOut = "Lock Vault"
     toLine Sync   = "Sync"
 
-data ItemAction = Paste Label Text
-    deriving stock (Show, Eq)
+data ItemAction = ItemAction
+    { itemActionLabel :: Text
+    , itemActionRun   :: Shell ()
+    }
 
 instance ToLine ItemAction where
-    toLine (Paste lbl _) = "Paste " <> unsafeTextToLine (unLabel lbl)
+    toLine (ItemAction label _) = unsafeTextToLine label
 
 newtype Label = Label {unLabel :: Text}
     deriving stock (Show, Eq)
@@ -130,10 +155,6 @@ instance IsString Label where
     fromString = Label . Text.pack
 
 data Action = Meta MetaAction | Vault VaultAction | Item ItemAction
-    deriving stock (Show, Eq)
-
-otherActions :: [Line]
-otherActions = map (toLine @VaultAction) [minBound ..]
 
 {-
 Handle errors that can occur when making requests to the vault server.
@@ -184,30 +205,6 @@ logout env = callApi lock env >>= \res -> dmenuShow (unLockDataTitle res)
 
 getItems :: ClientEnv -> Shell [ItemTemplate]
 getItems = coerce . callApi (vaultClient // itemsEp // getItemsEp)
-
-getItemsMock :: ClientEnv -> Shell [ItemTemplate]
-getItemsMock _ =
-    pure $
-        map
-            ( ( \i ->
-                    ItemTemplate
-                        { itfolderId = Just $ "folder " <> i
-                        , itName = "name " <> i
-                        , itNotes = Just $ "note " <> i
-                        , itItem =
-                            ItemLogin
-                                ( Login
-                                    { loginUris = [Uri $ "https://somthing.se/" <> i]
-                                    , loginUsername = "username " <> i
-                                    , loginPassword = "password " <> i
-                                    }
-                                )
-                        }
-              )
-                . Text.pack
-                . show @Int
-            )
-            [1 .. 30]
 
 getStatus :: ClientEnv -> Shell StatusData
 getStatus = callApi (vaultClient // miscEp // statusEp)
@@ -356,17 +353,13 @@ instance ToLine ItemTemplate where
     toLine (ItemTemplate _ name _ item) = merge $
         mapMaybe textToLine $
             mappend [toEmoji item, name] $ case item of
-                ItemLogin Login{..} -> [loginUsername] <> map unUri loginUris
-                ItemCard Card{..}   -> [Text.take 5 cardNumber <> "..."]
-                ItemIdentity _      -> ["Identity"]
-                ItemSecureNote _    -> ["Secure Note"]
+                ItemLogin itemLogin -> catMaybes [loginUsername itemLogin] <> maybe [] coerce (loginUris itemLogin)
+                ItemCard Card{..} -> [Text.take 5 cardNumber <> "..."]
+                ItemIdentity _ -> ["Identity"]
+                ItemSecureNote _ -> ["Secure Note"]
 
 merge :: [Line] -> Line
 merge = mconcat . intersperse " - "
-
-safeHead :: [a] -> Maybe a
-safeHead []      = Nothing
-safeHead (x : _) = Just x
 
 data ItemTemplate = ItemTemplate
     { itfolderId :: Maybe Text
@@ -388,15 +381,15 @@ instance FromJSON Uri where
     parseJSON = withObject "Uri" $ \o -> Uri <$> o .: "uri"
 
 data Login = Login
-    { loginUris     :: [Uri]
-    , loginUsername :: Text
-    , loginPassword :: Text
+    { loginUris     :: Maybe [Uri]
+    , loginUsername :: Maybe Text
+    , loginPassword :: Maybe Text
     }
     deriving stock (Show, Eq, Ord)
 
 instance FromJSON Login where
     parseJSON = withObject "Login" $ \o ->
-        Login <$> o .: "uris" <*> o .: "username" <*> o .: "password"
+        Login <$> o .:? "uris" <*> o .:? "username" <*> o .: "password"
 
 newtype SecureNote = SecureNote
     { secureNoteType :: Int
