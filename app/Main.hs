@@ -12,7 +12,7 @@ import           Data.Aeson          (FromJSON (parseJSON), ToJSON (toJSON),
                                       decode, object, withObject, withText,
                                       (.:), (.:?), (.=))
 import           Data.Coerce         (coerce)
-import           Data.List           (intersperse, sort)
+import           Data.List           (intersperse)
 import           Data.List.NonEmpty  (NonEmpty)
 import qualified Data.List.NonEmpty  as NonEmpty
 import qualified Data.Map            as Map
@@ -20,7 +20,6 @@ import           Data.Maybe          (catMaybes, fromMaybe, mapMaybe)
 import           Data.Ord            (comparing)
 import           Data.Text           (Text)
 import qualified Data.Text           as Text
-import qualified Data.Text.IO
 import           GHC.Generics        (Generic)
 import           Network.HTTP.Client (defaultManagerSettings, newManager)
 import           Prelude             hiding (log)
@@ -34,8 +33,9 @@ import           Servant.Client      (AsClientT, ClientEnv, ClientError (..),
 import           Turtle              (IsString (fromString), Line,
                                       MonadIO (liftIO), Shell, UTCTime, die,
                                       inproc, lineToText, select, sh,
-                                      textToLine, textToLines, unsafeTextToLine,
-                                      void, when, (>=>))
+                                      textToLine, textToLines, toLines,
+                                      unsafeTextToLine, void, when, (>=>))
+import           Turtle.Prelude      (need)
 
 default (Text)
 
@@ -43,11 +43,14 @@ class ToLine a where
     toLine :: a -> Line
 
 dmenuSelect :: [Text.Text] -> Text -> NonEmpty Line -> Shell Line
-dmenuSelect args p ls = inproc "dmenu" (["-i", "-l", Text.pack (show (min 24 (length ls))), "-p", p] <> args) (select ls)
+dmenuSelect args p ls =
+    inproc
+        "dmenu"
+        (["-i", "-l", Text.pack (show (min 24 (length ls))), "-p", p] <> args)
+        (select ls)
 
 main :: IO ()
 main = do
-    -- [pass] <- Text.lines <$> Data.Text.IO.readFile ".env.development"
     manager <- newManager defaultManagerSettings
     baseUrl <- parseBaseUrl "http://localhost:8087"
     let env = mkClientEnv manager baseUrl
@@ -59,73 +62,77 @@ main = do
                 askPassword >>= login env
 
         items <- getItems env
-        handleView (DashboardView [Sync, LogOut] items)
-
-presentItemOptions :: ItemTemplate -> Shell Line
-presentItemOptions = dmenuSelect [] "" . NonEmpty.fromList . ("Back" :) . map toLine . itemOptions
+        handleView env (DashboardView items)
 
 paste :: Text -> Shell ()
 paste text = void $ inproc "xdotool" ["type", text] ""
 
-itemOptions :: ItemTemplate -> [ItemAction]
+openEditor :: Shell Line -> Shell ()
+openEditor stdin = do
+    editor <- need "EDITOR"
+    case editor of
+        Just e  -> void $ inproc e [] stdin
+        Nothing -> die "EDITOR not set"
+
+itemOptions :: ItemTemplate -> [ItemAction ()]
 itemOptions it = case itItem it of
-    ItemLogin (Login _ name pw) ->
+    ItemLogin l         -> loginActions l
+    ItemCard c          -> cardActions c
+    ItemSecureNote _    -> secureNoteActions it
+    ItemIdentity _ident -> []
+  where
+    cardActions :: Card -> [ItemAction ()]
+    cardActions (Card _ number code) =
+        [ ItemAction ("CVV: " <> unsafeTextToLine code) (paste code)
+        , ItemAction ("Number: " <> unsafeTextToLine number) (paste number)
+        ]
+    loginActions :: Login -> [ItemAction ()]
+    loginActions (Login _ name pw) =
         catMaybes
-            [ ItemAction <$> fmap ("Username: " <>) name <*> fmap paste name
+            [ ItemAction <$> fmap (unsafeTextToLine . ("Username: " <>)) name <*> fmap paste name
             , ItemAction "Password: ********" . paste <$> pw
             ]
-    ItemCard (Card _ number code) ->
-        [ ItemAction ("Number: " <> number) (paste number)
-        , ItemAction ("CVV: " <> code) (paste code)
-        ]
-    ItemSecureNote (SecureNote _note) -> undefined
-    ItemIdentity _ident -> []
+    secureNoteActions :: ItemTemplate -> [ItemAction ()]
+    secureNoteActions item = catMaybes [ItemAction ("Note: " <> NonEmpty.head (textToLines $ fromMaybe "" (itNotes item))) . openEditor . toLines . pure <$> itNotes item]
 
-data View = DashboardView [VaultAction] [ItemTemplate] | ItemView ItemTemplate
+data View = DashboardView [ItemTemplate] | ItemView ItemTemplate
 
-handleDashboardView :: [VaultAction] -> [ItemTemplate] -> Shell ()
-handleDashboardView actions items = do
-    let entries' = entries items
-    selected <- dmenuSelect [] "Entries" (NonEmpty.fromList (map toLine actions <> Map.keys entries'))
-    case parseVaultAction (lineToText selected) of
-        Just Sync   -> die "Synced"
-        Just LogOut -> die "Logged out"
-        Nothing     -> handleView (ItemView (entries' Map.! selected))
+handleDashboardView :: ClientEnv -> [ItemTemplate] -> Shell ()
+handleDashboardView env items = do
+    let itemEntries = entries items
+    let actions = [ItemAction "Log out" (logout env)]
+    let options = Map.fromList $ map (\(ItemAction label action) -> (label, action)) (actions <> itemEntries)
+    dmenuSelect [] "Entries" (NonEmpty.fromList (Map.keys options)) >>= (options Map.!)
   where
-    parseVaultAction :: Text -> Maybe VaultAction
-    parseVaultAction = (`Map.lookup` actions')
-      where
-        actions' :: Map.Map Text VaultAction
-        actions' =
-            Map.fromList $
-                zip (map (lineToText . toLine @VaultAction) [minBound ..]) [minBound ..]
-
-    entries :: (ToLine a) => [a] -> Map.Map Line a
-    entries xs = Map.fromList [(toEntry (i, x), x) | (i, x) <- [1 :: Int ..] `zip` xs]
+    entries :: [ItemTemplate] -> [ItemAction ()]
+    entries xs =
+        [ ItemAction (toEntry (i, x)) (handleView env (ItemView x))
+        | (i, x) <- [1 :: Int ..] `zip` xs
+        ]
       where
         toEntry :: (Show a) => (ToLine b) => (a, b) -> Line
         toEntry (i, x) =
-            unsafeTextToLine
-                (Text.pack (replicate (width xs - length (show i)) ' ' <> show i <> ". "))
-                <> toLine x
+            unsafeTextToLine (Text.pack (replicate (width xs - length (show i)) ' ' <> show i <> ". ")) <> toLine x
 
         width :: [a] -> Int
         width = length . show . length
 
-handleView :: View -> Shell ()
-handleView = \case
-    DashboardView actions items -> handleDashboardView actions items
-    ItemView item -> handleItemView item
+handleView :: ClientEnv -> View -> Shell ()
+handleView env view = case view of
+    DashboardView items -> handleDashboardView env items
+    ItemView item       -> handleItemView item
 
 handleItemView :: ItemTemplate -> Shell ()
 handleItemView item =
-    dmenuSelect [] (itName item) options
-        >>= itemActionRun . (entries Map.!)
+    dmenuSelect [] "Entry" (NonEmpty.fromList (Map.keys options))
+        >>= (options Map.!)
   where
-    options = NonEmpty.fromList (Map.keys entries)
-    entries =
-        let opts = itemOptions item
-         in (Map.fromList . zip (map toLine opts)) opts
+    options =
+        Map.fromList
+            ( map
+                (\(ItemAction label action) -> (label, action))
+                (itemOptions item)
+            )
 
 data MetaAction = Back
     deriving stock (Show, Eq)
@@ -133,28 +140,16 @@ data MetaAction = Back
 instance ToLine MetaAction where
     toLine Back = "Back"
 
-data VaultAction = Sync | LogOut
-    deriving stock (Show, Eq, Enum, Bounded)
-
-instance ToLine VaultAction where
-    toLine LogOut = "Lock Vault"
-    toLine Sync   = "Sync"
-
-data ItemAction = ItemAction
-    { itemActionLabel :: Text
-    , itemActionRun   :: Shell ()
+data ItemAction a = ItemAction
+    { itemActionLabel :: Line
+    , itemActionRun   :: Shell a
     }
-
-instance ToLine ItemAction where
-    toLine (ItemAction label _) = unsafeTextToLine label
 
 newtype Label = Label {unLabel :: Text}
     deriving stock (Show, Eq)
 
 instance IsString Label where
     fromString = Label . Text.pack
-
-data Action = Meta MetaAction | Vault VaultAction | Item ItemAction
 
 {-
 Handle errors that can occur when making requests to the vault server.
@@ -189,6 +184,9 @@ askPassword = Password . lineToText <$> inproc "dmenu" args ""
   where
     obscureColor = "#222222"
     args = ["-p", "Enter Password ", "-nb", obscureColor, "-nf", obscureColor]
+
+sync :: ClientEnv -> Shell ()
+sync env = undefined
 
 login :: ClientEnv -> Password -> Shell UnlockData
 login env pw =
@@ -342,8 +340,8 @@ data Item
     | ItemIdentity Identity
     deriving stock (Show, Eq, Ord)
 
-toEmoji :: Item -> Text
-toEmoji = \case
+toSymbol :: Item -> Text
+toSymbol = \case
     ItemLogin _ -> "(l)"
     ItemCard _ -> "(c)"
     ItemIdentity _ -> "(i)"
@@ -352,7 +350,7 @@ toEmoji = \case
 instance ToLine ItemTemplate where
     toLine (ItemTemplate _ name _ item) = merge $
         mapMaybe textToLine $
-            mappend [toEmoji item, name] $ case item of
+            mappend [toSymbol item, name] $ case item of
                 ItemLogin itemLogin -> catMaybes [loginUsername itemLogin] <> maybe [] coerce (loginUris itemLogin)
                 ItemCard Card{..} -> [Text.take 5 cardNumber <> "..."]
                 ItemIdentity _ -> ["Identity"]
@@ -391,13 +389,11 @@ instance FromJSON Login where
     parseJSON = withObject "Login" $ \o ->
         Login <$> o .:? "uris" <*> o .:? "username" <*> o .: "password"
 
-newtype SecureNote = SecureNote
-    { secureNoteType :: Int
-    }
+data SecureNote = SecureNote
     deriving stock (Show, Eq, Ord)
 
 instance FromJSON SecureNote where
-    parseJSON = withObject "SecureNote" $ \o -> SecureNote <$> o .: "type"
+    parseJSON = withObject "SecureNote" $ const (pure SecureNote)
 
 data Card = Card
     { cardHoleName :: Text
@@ -410,7 +406,7 @@ instance FromJSON Card where
     parseJSON = withObject "Card" $ \o ->
         Card <$> o .: "cardholderName" <*> o .: "number" <*> o .: "code"
 
-data Identity = Identity {}
+data Identity = Identity
     deriving stock (Show, Eq, Ord)
 
 instance FromJSON Identity where
