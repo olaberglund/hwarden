@@ -1,5 +1,4 @@
 {-# LANGUAGE DataKinds            #-}
-{-# LANGUAGE DeriveAnyClass       #-}
 {-# LANGUAGE DerivingStrategies   #-}
 {-# LANGUAGE ExtendedDefaultRules #-}
 {-# LANGUAGE LambdaCase           #-}
@@ -39,8 +38,8 @@ import           Turtle.Prelude      (need)
 
 default (Text)
 
-class ToLine a where
-    toLine :: a -> Line
+class ToEntry a where
+    toEntry :: a -> Line
 
 dmenuSelect :: [Text.Text] -> Text -> NonEmpty Line -> Shell Line
 dmenuSelect args p ls =
@@ -74,45 +73,64 @@ openEditor stdin = do
         Just e  -> void $ inproc e [] stdin
         Nothing -> die "EDITOR not set"
 
-itemOptions :: ItemTemplate -> [ItemAction ()]
-itemOptions it = case itItem it of
+itemEntries :: ItemTemplate -> [Entry ()]
+itemEntries it = case itItem it of
     ItemLogin l         -> loginActions l
     ItemCard c          -> cardActions c
     ItemSecureNote _    -> secureNoteActions it
     ItemIdentity _ident -> []
   where
-    cardActions :: Card -> [ItemAction ()]
+    cardActions :: Card -> [Entry ()]
     cardActions (Card _ number code) =
-        [ ItemAction ("CVV: " <> unsafeTextToLine code) (paste code)
-        , ItemAction ("Number: " <> unsafeTextToLine number) (paste number)
+        [ Entry Item ("CVV: " <> unsafeTextToLine code) (paste code)
+        , Entry Item ("Number: " <> unsafeTextToLine number) (paste number)
         ]
-    loginActions :: Login -> [ItemAction ()]
+    loginActions :: Login -> [Entry ()]
     loginActions (Login _ name pw) =
         catMaybes
-            [ ItemAction <$> fmap (unsafeTextToLine . ("Username: " <>)) name <*> fmap paste name
-            , ItemAction "Password: ********" . paste <$> pw
+            [ Entry Item <$> fmap (unsafeTextToLine . ("Username: " <>)) name <*> fmap paste name
+            , Entry Item "Password: ********" . paste <$> pw
             ]
-    secureNoteActions :: ItemTemplate -> [ItemAction ()]
-    secureNoteActions item = catMaybes [ItemAction ("Note: " <> NonEmpty.head (textToLines $ fromMaybe "" (itNotes item))) . openEditor . toLines . pure <$> itNotes item]
+    secureNoteActions :: ItemTemplate -> [Entry ()]
+    secureNoteActions item =
+        catMaybes
+            [ Entry
+                Item
+                ("Note: " <> NonEmpty.head (textToLines $ fromMaybe "" (itNotes item)))
+                . openEditor
+                . toLines
+                . pure
+                <$> itNotes item
+            ]
 
 data View = DashboardView [ItemTemplate] | ItemView ItemTemplate
 
+entriesToMap :: [Entry a] -> Map.Map Line (Shell a)
+entriesToMap = Map.fromList . map (\e -> (entryLabel e, entryRun e))
+
+runSelected :: Map.Map Line (Shell a) -> Line -> Shell a
+runSelected actions selected = case Map.lookup selected actions of
+    Just action -> action
+    Nothing     -> logId (lineToText $ "No such entry: " <> selected) >>= die
+
 handleDashboardView :: ClientEnv -> [ItemTemplate] -> Shell ()
 handleDashboardView env items = do
-    let itemEntries = entries items
-    let actions = [ItemAction "Log out" (logout env)]
-    let options = Map.fromList $ map (\(ItemAction label action) -> (label, action)) (actions <> itemEntries)
-    dmenuSelect [] "Entries" (NonEmpty.fromList (Map.keys options)) >>= (options Map.!)
+    let miscEntries = [Entry Misc "Log out" (logout env)]
+    let allEntries = miscEntries <> entries items
+    let actions = entriesToMap allEntries
+    dmenuSelect [] "Entries" (NonEmpty.fromList (map entryLabel allEntries))
+        >>= runSelected actions
   where
-    entries :: [ItemTemplate] -> [ItemAction ()]
+    entries :: [ItemTemplate] -> [Entry ()]
     entries xs =
-        [ ItemAction (toEntry (i, x)) (handleView env (ItemView x))
+        [ Entry Item (toEntry' (i, x)) (handleView env (ItemView x))
         | (i, x) <- [1 :: Int ..] `zip` xs
         ]
       where
-        toEntry :: (Show a) => (ToLine b) => (a, b) -> Line
-        toEntry (i, x) =
-            unsafeTextToLine (Text.pack (replicate (width xs - length (show i)) ' ' <> show i <> ". ")) <> toLine x
+        toEntry' :: (Show a) => (ToEntry b) => (a, b) -> Line
+        toEntry' (i, x) = unsafeTextToLine (Text.pack $ spaces i <> show i <> ". ") <> toEntry x
+
+        spaces i = replicate (width xs - length (show i)) ' '
 
         width :: [a] -> Int
         width = length . show . length
@@ -124,26 +142,25 @@ handleView env view = case view of
 
 handleItemView :: ItemTemplate -> Shell ()
 handleItemView item =
-    dmenuSelect [] "Entry" (NonEmpty.fromList (Map.keys options))
-        >>= (options Map.!)
+    dmenuSelect [] "Entry" (NonEmpty.fromList (map entryLabel entries))
+        >>= runSelected (entriesToMap entries)
   where
-    options =
-        Map.fromList
-            ( map
-                (\(ItemAction label action) -> (label, action))
-                (itemOptions item)
-            )
+    entries = itemEntries item
+data ActionLevel = Misc | Meta | Item
+    deriving (Show, Eq, Ord)
 
-data MetaAction = Back
-    deriving stock (Show, Eq)
-
-instance ToLine MetaAction where
-    toLine Back = "Back"
-
-data ItemAction a = ItemAction
-    { itemActionLabel :: Line
-    , itemActionRun   :: Shell a
+data Entry a = Entry
+    { entryLevel :: ActionLevel
+    , entryLabel :: Line
+    , entryRun   :: Shell a
     }
+
+instance Eq (Entry a) where
+    (Entry level1 label1 _) == (Entry level2 label2 _) =
+        level1 == level2 && label1 == label2
+
+instance Ord (Entry a) where
+    compare = comparing entryLevel
 
 newtype Label = Label {unLabel :: Text}
     deriving stock (Show, Eq)
@@ -173,20 +190,17 @@ handleClientError clientError =
             . decode @VaultFailureResponse
             . responseBody
 
-    logId :: Text -> Shell Text
-    logId err = dmenuShow err >> pure err
+logId :: Text -> Shell Text
+logId err = dmenuShow err >> pure err
 
-    log :: Text -> Response -> Shell Text
-    log err full = dmenuShow err >> pure (err <> ":" <> Text.pack (show (responseBody full)))
+log :: Text -> Response -> Shell Text
+log err full = dmenuShow err >> pure (err <> ":" <> Text.pack (show (responseBody full)))
 
 askPassword :: Shell Password
 askPassword = Password . lineToText <$> inproc "dmenu" args ""
   where
     obscureColor = "#222222"
     args = ["-p", "Enter Password ", "-nb", obscureColor, "-nf", obscureColor]
-
-sync :: ClientEnv -> Shell ()
-sync env = undefined
 
 login :: ClientEnv -> Password -> Shell UnlockData
 login env pw =
@@ -197,7 +211,7 @@ login env pw =
     unlock = vaultClient // lockingEp // unlockEp
 
 logout :: ClientEnv -> Shell ()
-logout env = callApi lock env >>= \res -> dmenuShow (unLockDataTitle res)
+logout env = callApi lock env >>= dmenuShow . unLockDataTitle
   where
     lock = vaultClient // lockingEp // lockEp
 
@@ -214,7 +228,7 @@ callApi action env =
         Right (VaultResponse res) -> pure res
 
 dmenuShow :: Text -> Shell ()
-dmenuShow msg = void $ dmenuSelect [] "" (textToLines msg)
+dmenuShow = void . dmenuSelect [] "" . textToLines
 
 type Todo = PostNoContent
 
@@ -347,8 +361,8 @@ toSymbol = \case
     ItemIdentity _ -> "(i)"
     ItemSecureNote _ -> "(s)"
 
-instance ToLine ItemTemplate where
-    toLine (ItemTemplate _ name _ item) = merge $
+instance ToEntry ItemTemplate where
+    toEntry (ItemTemplate _ name _ item) = merge $
         mapMaybe textToLine $
             mappend [toSymbol item, name] $ case item of
                 ItemLogin itemLogin -> catMaybes [loginUsername itemLogin] <> maybe [] coerce (loginUris itemLogin)
