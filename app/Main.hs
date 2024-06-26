@@ -21,7 +21,7 @@ import           Data.Text           (Text)
 import qualified Data.Text           as Text
 import           GHC.Generics        (Generic)
 import           Network.HTTP.Client (defaultManagerSettings, newManager)
-import           Prelude             hiding (log)
+import           Prelude             hiding (lines, log)
 import           Servant             (Get, JSON, NamedRoutes, Post,
                                       PostNoContent, Proxy (Proxy), ReqBody,
                                       (:-), (:>))
@@ -93,15 +93,16 @@ itemEntries it = case itItem it of
             ]
     secureNoteActions :: ItemTemplate -> [Entry ()]
     secureNoteActions item =
-        catMaybes
-            [ Entry
-                Item
-                ("Note: " <> NonEmpty.head (textToLines $ fromMaybe "" (itNotes item)))
-                . openEditor
-                . toLines
-                . pure
-                <$> itNotes item
-            ]
+        let lines = textToLines $ fromMaybe "" (itNotes item)
+         in catMaybes
+                [ Entry
+                    Item
+                    ("Note: " <> NonEmpty.head lines <> " (" <> unsafeTextToLine (Text.pack $ show $ length lines) <> " lines)")
+                    . openEditor
+                    . toLines
+                    . pure
+                    <$> itNotes item
+                ]
 
 data View = DashboardView [ItemTemplate] | ItemView ItemTemplate
 
@@ -154,13 +155,6 @@ data Entry a = Entry
     , entryLabel :: Line
     , entryRun   :: Shell a
     }
-
-instance Eq (Entry a) where
-    (Entry level1 label1 _) == (Entry level2 label2 _) =
-        level1 == level2 && label1 == label2
-
-instance Ord (Entry a) where
-    compare = comparing entryLevel
 
 newtype Label = Label {unLabel :: Text}
     deriving stock (Show, Eq)
