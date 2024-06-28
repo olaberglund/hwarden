@@ -122,7 +122,7 @@ runSelected actions selected = case Map.lookup selected actions of
 
 handleDashboardView :: ClientEnv -> [ItemTemplate] -> Shell ()
 handleDashboardView env items = do
-    let miscEntries = [Entry Misc "Log out" (logout env)]
+    let miscEntries = [Entry Misc "Sync" (sync env), Entry Misc "Log out" (logout env)]
     let allEntries = miscEntries <> entries items
     let actions = entriesToMap allEntries
     dmenuSelect [] "Entries" (NonEmpty.fromList (map entryLabel allEntries))
@@ -211,9 +211,14 @@ login env pw =
     unlock = vaultClient // lockingEp // unlockEp
 
 logout :: ClientEnv -> Shell ()
-logout env = callApi lock env >>= dmenuShow . unLockDataTitle
+logout env = callApi lock env >>= dmenuShow . unTitledData
   where
     lock = vaultClient // lockingEp // lockEp
+
+sync :: ClientEnv -> Shell ()
+sync env = callApi sync' env >>= dmenuShow . unTitledData
+  where
+    sync' = vaultClient // miscEp // syncEp
 
 getItems :: ClientEnv -> Shell [ItemTemplate]
 getItems = coerce . callApi (vaultClient // itemsEp // getItemsEp)
@@ -240,7 +245,7 @@ data VaultApi as = VaultApi
     deriving stock (Generic)
 
 data VaultLockApi as = LockApi
-    { lockEp :: as :- "lock" :> Post '[JSON] (VaultResponse LockData)
+    { lockEp :: as :- "lock" :> Post '[JSON] (VaultResponse TitledData)
     , unlockEp :: as :- "unlock" :> ReqBody '[JSON] Password :> Post '[JSON] (VaultResponse UnlockData)
     }
     deriving stock (Generic)
@@ -279,13 +284,13 @@ instance FromJSON UnlockData where
     parseJSON = withObject "UnlockData" $ \o ->
         UnlockData <$> o .: "title" <*> o .: "raw"
 
-newtype LockData = LockData
-    { unLockDataTitle :: Text
+newtype TitledData = TitledData
+    { unTitledData :: Text
     }
     deriving stock (Show, Eq)
 
-instance FromJSON LockData where
-    parseJSON = withObject "LockData" $ \o -> LockData <$> o .: "title"
+instance FromJSON TitledData where
+    parseJSON = withObject "TitledData" $ \o -> TitledData <$> o .: "title"
 
 newtype Password = Password
     { unPassword :: Text
@@ -305,8 +310,9 @@ data VaultItemsApi as = VaultItemsApi
     }
     deriving stock (Generic)
 
-newtype VaultMiscellaneousApi as = VaultMiscellaneousApi
+data VaultMiscellaneousApi as = VaultMiscellaneousApi
     { statusEp :: as :- "status" :> Get '[JSON] (VaultResponse StatusData)
+    , syncEp   :: as :- "sync" :> Post '[JSON] (VaultResponse TitledData)
     }
     deriving stock (Generic)
 
