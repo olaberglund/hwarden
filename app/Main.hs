@@ -31,12 +31,16 @@ import           Servant.Client      (AsClientT, ClientEnv, ClientError (..),
                                       (//))
 import           Turtle              (IsString (fromString), Line,
                                       MonadIO (liftIO), Shell, UTCTime, die,
-                                      inproc, lineToText, select, sh,
-                                      textToLine, textToLines, toLines,
-                                      unsafeTextToLine, void, when, (>=>))
+                                      inproc, lineToText, mktempfile, output,
+                                      select, sh, textToLine, textToLines,
+                                      toLines, unsafeTextToLine, void, when,
+                                      (>=>))
 import           Turtle.Prelude      (need)
 
 default (Text)
+
+term :: Text
+term = "st"
 
 class ToEntry a where
     toEntry :: a -> Line
@@ -66,11 +70,13 @@ main = do
 paste :: Text -> Shell ()
 paste text = void $ inproc "xdotool" ["type", text] ""
 
-openEditor :: Shell Line -> Shell ()
-openEditor stdin = do
+openInEditor :: Shell Line -> Shell ()
+openInEditor stdin = do
     editor <- need "EDITOR"
+    fp <- mktempfile "/tmp" "hwarden"
+    output fp stdin
     case editor of
-        Just e  -> void $ inproc e [] stdin
+        Just e  -> void $ inproc term [e, Text.pack fp] ""
         Nothing -> die "EDITOR not set"
 
 itemEntries :: ItemTemplate -> [Entry ()]
@@ -98,7 +104,7 @@ itemEntries it = case itItem it of
                 [ Entry
                     Item
                     ("Note: " <> NonEmpty.head lines <> " (" <> unsafeTextToLine (Text.pack $ show $ length lines) <> " lines)")
-                    . openEditor
+                    . openInEditor
                     . toLines
                     . pure
                     <$> itNotes item
