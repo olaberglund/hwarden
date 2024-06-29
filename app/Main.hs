@@ -7,14 +7,14 @@
 
 module Main where
 
-import           Control.Monad       (void, when, (>=>))
+import           Control.Monad       (replicateM_, void, when, (>=>))
 import           Data.Aeson          (FromJSON (parseJSON), ToJSON (toJSON),
                                       decode, object, withObject, withText,
                                       (.:), (.:?), (.=))
 import           Data.Coerce         (coerce)
-import           Data.List           (intersperse)
+import           Data.List           (find, intersperse)
 import qualified Data.Map            as Map
-import           Data.Maybe          (catMaybes, fromMaybe)
+import           Data.Maybe          (catMaybes, fromMaybe, isJust)
 import           Data.Ord            (comparing)
 import           Data.Text           (Text)
 import qualified Data.Text           as Text
@@ -30,8 +30,9 @@ import           Servant.Client      (AsClientT, ClientEnv, ClientError (..),
                                       parseBaseUrl, responseBody, runClientM,
                                       (//))
 import           Shelly              (Sh, errorExit, fromText, get_env, liftIO,
-                                      run, run_, setStdin, shelly, toTextIgnore,
-                                      verbosely, withTmpDir, writefile, (<.>))
+                                      readfile, run, run_, setStdin, shelly,
+                                      toTextIgnore, whenM, withTmpDir,
+                                      writefile, (<.>), (</>))
 
 default (Text)
 
@@ -53,7 +54,7 @@ main = do
 
         when (statusDataStatus status == Locked) $
             void $
-                askPassword >>= \(Password p) -> login env (Password (head (Text.lines p)))
+                askPassword >>= login env . Password . head . Text.lines . coerce
 
         items <- getItems env
         handleView env (DashboardView items)
@@ -67,56 +68,69 @@ pressKey key = xdotool ["key", key]
 xdotool :: [Text] -> Sh ()
 xdotool = run_ "xdotool"
 
-quickAction :: Item -> Sh ()
-quickAction item = case item of
-    ItemLogin (Login{..}) -> case (loginUsername, loginPassword) of
-        (Just u, Just p) -> paste u >> pressKey "Tab" >> paste p >> pressKey "Return"
-        _ -> void $ logId "No username or password"
-    ItemCard (Card{..}) -> case (cardHolderName, cardNumber, cardCode) of
-        (h, n, c) -> paste h >> paste " " >> paste n >> paste " " >> paste c
+dashboardAction :: ItemTemplate -> Sh ()
+dashboardAction i = case itItem i of
     ItemIdentity _ -> paste "identity"
-    ItemSecureNote _ -> paste "note"
+    ItemSecureNote _ -> case itNotes i of
+        Just n  -> openInEditor n
+        Nothing -> dmenuShow "No note"
+    ItemCard (Card{..}) ->
+        openInEditor (Text.unlines [cardHolderName, cardNumber, cardCode])
+    ItemLogin (Login{..}) -> case (loginUsername, loginPassword) of
+        (Just u, Just p) -> do
+            paste u
+            pressKey "Tab"
+            paste p
+            replicateM_ 2 (pressKey "Return")
+        _ -> dmenuShow "No username or password"
 
 openInEditor :: Text -> Sh ()
 openInEditor text = do
     editor <- get_env "EDITOR"
-    term <- get_env "TERM"
     case editor of
         Nothing -> errorExit "EDITOR not set"
-        Just e -> case term of
-            Nothing -> errorExit "TERM not set"
-            Just t -> withTmpDir $ \fp -> do
-                writefile (fp <.> "hwarden") text
-                run_ (fromText t) [e, toTextIgnore (fp <.> "hwarden")]
-
--- fp <- mktempfile "/tmp" "hwarden"
--- output fp text
--- case editor of
---     Nothing -> die "EDITOR not set"
---     Just e -> case term of
---         Nothing -> die "TERM not set"
---         Just t  -> void $ inproc t [e, Text.pack fp] ""
+        Just e -> withTmpDir $ \fp -> do
+            writefile (fp <.> "hwarden") text
+            run_ "st" [e, toTextIgnore (fp <.> "hwarden")]
 
 individualItemEntries :: ItemTemplate -> [Entry ()]
-individualItemEntries it = case itItem it of
-    ItemLogin l         -> loginActions l
-    ItemCard c          -> cardActions c
-    ItemSecureNote _    -> secureNoteActions it
-    ItemIdentity _ident -> []
+individualItemEntries it =
+    commonEntries <> case itItem it of
+        ItemLogin l         -> loginEntries l
+        ItemCard c          -> cardEntries c
+        ItemSecureNote _    -> noteEntries it
+        ItemIdentity _ident -> []
   where
-    cardActions :: Card -> [Entry ()]
-    cardActions (Card _ number code) =
+    commonEntries =
+        catMaybes
+            [ Just (Entry Item ("Title: " <> itName it) (pure ()))
+            , Entry Item <$> fmap ("Folder: " <>) (itFolderId it) <*> Just (pure ())
+            , Entry Item <$> fmap ("Notes: " <>) (itFolderId it) <*> Just (pure ())
+            ]
+
+    cardEntries :: Card -> [Entry ()]
+    cardEntries (Card _ number code) =
         [ Entry Item ("CVV: " <> code) (paste code)
         , Entry Item ("Number: " <> number) (paste number)
         ]
-    loginActions :: Login -> [Entry ()]
-    loginActions (Login _ name pw) =
+
+    loginEntries :: Login -> [Entry ()]
+    loginEntries (Login uris name pw totp) =
         catMaybes
             [ Entry Item <$> fmap ("Username: " <>) name <*> fmap paste name
             , Entry Item "Password: ********" . paste <$> pw
+            , Entry Item <$> fmap ("TOTP: " <>) totp <*> Just (pure ())
             ]
-    secureNoteActions :: ItemTemplate -> [Entry ()]
-    secureNoteActions item =
+            <> maybe
+                []
+                ( map
+                    ( \(Uri uri, i) ->
+                        Entry Item ("URI " <> Text.pack (show i) <> ": " <> uri) (run_ "firefox" [uri])
+                    )
+                )
+                (zip <$> uris <*> pure [1 :: Int ..])
+    noteEntries :: ItemTemplate -> [Entry ()]
+    noteEntries item =
         let lines' = Text.lines $ fromMaybe "" (itNotes item)
          in catMaybes
                 [ Entry
@@ -138,7 +152,7 @@ runSelected actions selected = case Map.lookup selected actions of
 
 handleDashboardView :: ClientEnv -> [ItemTemplate] -> Sh ()
 handleDashboardView env items = do
-    let allEntries = miscEntries <> itemEntries items (quickAction . itItem)
+    let allEntries = miscEntries <> itemEntries items dashboardAction
     let actions = entriesToMap allEntries
     dmenuSelect [] "Entries" (Text.unlines (map entryLabel allEntries))
         >>= runSelected actions . head . Text.lines
@@ -146,7 +160,7 @@ handleDashboardView env items = do
     miscEntries :: [Entry ()]
     miscEntries =
         [ Entry Misc "View/Type individual entries" (handleAllItemsView env items)
-        , Entry Misc "View previous entry (TODO)" (pure ())
+        , Entry Misc "View previous entry" (readCache >>= itemWithId items >>= handleItemView)
         , Entry Misc "Edit entry (TODO)" (pure ())
         , Entry Misc "Add entry (TODO)" (pure ())
         , Entry Misc "Manage folders (TODO)" (pure ())
@@ -155,6 +169,24 @@ handleDashboardView env items = do
         , Entry Misc "Switch vaults (TODO)" (sync env)
         , Entry Misc "Lock vault" (logout env)
         ]
+
+withCacheFile :: (FilePath -> Sh b) -> Sh b
+withCacheFile action = do
+    maybeHome <- get_env "HOME"
+    case maybeHome of
+        Just home -> action (fromText $ home <> "/.cache/hwarden")
+        Nothing   -> errorExit "HOME not set"
+
+writeCache :: Text -> Sh ()
+writeCache = withCacheFile . flip writefile
+
+readCache :: Sh Text
+readCache = withCacheFile readfile
+
+itemWithId :: [ItemTemplate] -> Text -> Sh ItemTemplate
+itemWithId items id' = case find ((== id') . itId) items of
+    Just x  -> pure x
+    Nothing -> errorExit "Could not find the previous item"
 
 handleAllItemsView :: ClientEnv -> [ItemTemplate] -> Sh ()
 handleAllItemsView env items = do
@@ -180,13 +212,18 @@ itemEntries xs action =
 handleView :: ClientEnv -> View -> Sh ()
 handleView env view = case view of
     DashboardView items -> handleDashboardView env items
-    AllItemsView items  -> handleAllItemsView env items
-    ItemView item       -> handleItemView item
+    AllItemsView items -> handleAllItemsView env items
+    ItemView item -> do
+        maybeHome <- get_env "HOME"
+        case maybeHome of
+            Just home -> writefile (fromText $ home <> "/.cache/hwarden") (itId item)
+            Nothing -> return ()
+        handleItemView item
 
 handleItemView :: ItemTemplate -> Sh ()
 handleItemView item =
     dmenuSelect [] "Entry" (Text.unlines (map entryLabel entries))
-        >>= runSelected (entriesToMap entries)
+        >>= runSelected (entriesToMap entries) . head . Text.lines
   where
     entries = individualItemEntries item
 data ActionLevel = Misc | Meta | Item
@@ -396,23 +433,25 @@ toSymbol = \case
     ItemLogin _ -> "(l)"
     ItemCard _ -> "(c)"
     ItemIdentity _ -> "(i)"
-    ItemSecureNote _ -> "(s)"
+    ItemSecureNote _ -> "(n)"
 
 instance ToEntry ItemTemplate where
-    toEntry (ItemTemplate _ name _ item) =
+    toEntry (ItemTemplate _ _ name _ item) =
         mappend (toSymbol item <> " " <> name) $
-            merge $
-                case item of
-                    ItemLogin itemLogin -> catMaybes [loginUsername itemLogin] <> maybe [] coerce (loginUris itemLogin)
-                    ItemCard Card{..} -> [Text.take 5 cardNumber <> "..."]
-                    ItemIdentity _ -> ["Identity"]
-                    ItemSecureNote _ -> ["Secure Note"]
+            (\t -> if Text.null t then "" else " - " <> t) $
+                merge $
+                    case item of
+                        ItemLogin itemLogin -> catMaybes [loginUsername itemLogin] <> maybe [] coerce (loginUris itemLogin)
+                        ItemCard Card{..} -> [Text.take 5 cardNumber <> "..."]
+                        ItemIdentity _ -> []
+                        ItemSecureNote _ -> []
 
 merge :: [Text] -> Text
 merge = mconcat . intersperse " - "
 
 data ItemTemplate = ItemTemplate
-    { itfolderId :: Maybe Text
+    { itId       :: Text
+    , itFolderId :: Maybe Text
     , itName     :: Text
     , itNotes    :: Maybe Text
     , itItem     :: Item
@@ -434,12 +473,13 @@ data Login = Login
     { loginUris     :: Maybe [Uri]
     , loginUsername :: Maybe Text
     , loginPassword :: Maybe Text
+    , loginTotp     :: Maybe Text
     }
     deriving stock (Show, Eq, Ord)
 
 instance FromJSON Login where
     parseJSON = withObject "Login" $ \o ->
-        Login <$> o .:? "uris" <*> o .:? "username" <*> o .: "password"
+        Login <$> o .:? "uris" <*> o .:? "username" <*> o .: "password" <*> o .:? "totp"
 
 data SecureNote = SecureNote
     deriving stock (Show, Eq, Ord)
@@ -466,11 +506,12 @@ instance FromJSON Identity where
 
 instance FromJSON ItemTemplate where
     parseJSON = withObject "ItemTemplate" $ \o -> do
+        itId :: Text <- o .: "id"
         itType :: Int <- o .: "type"
         itFolderId <- o .: "folderId"
         itName <- o .: "name"
         itNotes <- o .: "notes"
-        let item = ItemTemplate itFolderId itName itNotes
+        let item = ItemTemplate itId itFolderId itName itNotes
         case itType of
             1 -> item . ItemLogin <$> o .: "login"
             2 -> item . ItemSecureNote <$> o .: "secureNote"
