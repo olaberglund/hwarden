@@ -76,8 +76,9 @@ executable hwarden
     , http-client
     , servant-client
     , servant-server
+    , shelly
     , text
-    , turtle
+    , time
     , warp
 
   -- Directories containing source files.
