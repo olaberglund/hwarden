@@ -12,9 +12,10 @@ import           Data.Aeson          (FromJSON (parseJSON), ToJSON (toJSON),
                                       decode, object, withObject, withText,
                                       (.:), (.:?), (.=))
 import           Data.Coerce         (coerce)
+import           Data.Functor        (($>), (<&>))
 import           Data.List           (find, intersperse)
 import qualified Data.Map            as Map
-import           Data.Maybe          (catMaybes, fromMaybe, isJust)
+import           Data.Maybe          (catMaybes, fromMaybe)
 import           Data.Ord            (comparing)
 import           Data.Text           (Text)
 import qualified Data.Text           as Text
@@ -23,16 +24,18 @@ import           GHC.Generics        (Generic)
 import           Network.HTTP.Client (defaultManagerSettings, newManager)
 import           Prelude             hiding (log)
 import           Servant             (Get, JSON, NamedRoutes, Post,
-                                      PostNoContent, Proxy (Proxy), ReqBody,
-                                      (:-), (:>))
+                                      PostNoContent, Proxy (Proxy), QueryFlag,
+                                      QueryParam, ReqBody, (:-), (:>))
 import           Servant.Client      (AsClientT, ClientEnv, ClientError (..),
                                       ClientM, Response, client, mkClientEnv,
                                       parseBaseUrl, responseBody, runClientM,
                                       (//))
 import           Shelly              (Sh, errorExit, fromText, get_env, liftIO,
                                       readfile, run, run_, setStdin, shelly,
-                                      toTextIgnore, whenM, withTmpDir,
-                                      writefile, (<.>), (</>))
+                                      silently, toTextIgnore, withTmpDir,
+                                      writefile, (<.>))
+import           Text.Read           (readMaybe)
+import qualified Text.Read           as Text
 
 default (Text)
 
@@ -43,6 +46,7 @@ dmenuSelect :: [Text.Text] -> Text -> Text -> Sh Text
 dmenuSelect args p ls =
     setStdin ls
         >> run "dmenu" (["-i", "-l", Text.pack (show (min 24 (length (Text.lines ls)))), "-p", p] <> args)
+        <&> head . Text.lines
 
 main :: IO ()
 main = do
@@ -57,7 +61,7 @@ main = do
                 askPassword >>= login env . Password . head . Text.lines . coerce
 
         items <- getItems env
-        handleView env (DashboardView items)
+        handleDashboardView env items
 
 paste :: Text -> Sh ()
 paste text = xdotool ["type", "--delay", "0", text]
@@ -72,10 +76,10 @@ dashboardAction :: ItemTemplate -> Sh ()
 dashboardAction i = case itItem i of
     ItemIdentity _ -> paste "identity"
     ItemSecureNote _ -> case itNotes i of
-        Just n  -> openInEditor n
+        Just n  -> openInEditor_ n
         Nothing -> dmenuShow "No note"
     ItemCard (Card{..}) ->
-        openInEditor (Text.unlines [cardHolderName, cardNumber, cardCode])
+        openInEditor_ (Text.unlines [cardHolderName, cardNumber, cardCode])
     ItemLogin (Login{..}) -> case (loginUsername, loginPassword) of
         (Just u, Just p) -> do
             paste u
@@ -84,7 +88,10 @@ dashboardAction i = case itItem i of
             replicateM_ 2 (pressKey "Return")
         _ -> dmenuShow "No username or password"
 
-openInEditor :: Text -> Sh ()
+openInEditor_ :: Text -> Sh ()
+openInEditor_ = void . openInEditor
+
+openInEditor :: Text -> Sh Text
 openInEditor text = do
     editor <- get_env "EDITOR"
     case editor of
@@ -92,6 +99,7 @@ openInEditor text = do
         Just e -> withTmpDir $ \fp -> do
             writefile (fp <.> "hwarden") text
             run_ "st" [e, toTextIgnore (fp <.> "hwarden")]
+            readfile (fp <.> "hwarden")
 
 individualItemEntries :: ItemTemplate -> [Entry ()]
 individualItemEntries it =
@@ -102,30 +110,33 @@ individualItemEntries it =
         ItemIdentity _ident -> []
   where
     commonEntries =
-        catMaybes
-            [ Just (Entry Item ("Title: " <> itName it) (pure ()))
-            , Entry Item <$> fmap ("Folder: " <>) (itFolderId it) <*> Just (pure ())
-            , Entry Item <$> fmap ("Notes: " <>) (itFolderId it) <*> Just (pure ())
-            ]
+        [ Entry ("Name:  " <> itName it) (pure ())
+        , Entry ("Folder: " <> orNone (itFolderId it)) (pure ())
+        , Entry ("Notes: " <> orNone (itNotes it)) (pure ())
+        ]
+
+    orNone :: Maybe Text -> Text
+    orNone = fromMaybe "None"
 
     cardEntries :: Card -> [Entry ()]
     cardEntries (Card _ number code) =
-        [ Entry Item ("CVV: " <> code) (paste code)
-        , Entry Item ("Number: " <> number) (paste number)
+        [ Entry ("CVV: " <> code) (paste code)
+        , Entry ("Number: " <> number) (paste number)
         ]
+
+    orDoNothing = maybe (pure ())
 
     loginEntries :: Login -> [Entry ()]
     loginEntries (Login uris name pw totp) =
-        catMaybes
-            [ Entry Item <$> fmap ("Username: " <>) name <*> fmap paste name
-            , Entry Item "Password: ********" . paste <$> pw
-            , Entry Item <$> fmap ("TOTP: " <>) totp <*> Just (pure ())
-            ]
+        [ Entry ("Username: " <> orNone name) (orDoNothing paste name)
+        , Entry "Password: ********" (orDoNothing paste pw)
+        , Entry ("TOTP: " <> orNone totp) (pure ())
+        ]
             <> maybe
                 []
                 ( map
                     ( \(Uri uri, i) ->
-                        Entry Item ("URI " <> Text.pack (show i) <> ": " <> uri) (run_ "firefox" [uri])
+                        Entry ("URI " <> Text.pack (show i) <> ": " <> uri) (run_ "firefox" [uri])
                     )
                 )
                 (zip <$> uris <*> pure [1 :: Int ..])
@@ -134,13 +145,49 @@ individualItemEntries it =
         let lines' = Text.lines $ fromMaybe "" (itNotes item)
          in catMaybes
                 [ Entry
-                    Item
                     ("Note: " <> head lines' <> " (" <> Text.pack (show $ length lines') <> " lines)")
-                    . openInEditor
+                    . openInEditor_
                     <$> itNotes item
                 ]
 
-data View = DashboardView [ItemTemplate] | ItemView ItemTemplate | AllItemsView [ItemTemplate]
+individualEditItemEntries :: ClientEnv -> ItemTemplate -> [Entry ()]
+individualEditItemEntries env it =
+    commonEntries <> itemSpecificEntries
+  where
+    itemSpecificEntries :: [Entry ()]
+    itemSpecificEntries = case itItem it of
+        ItemLogin l -> loginEntries l
+        _           -> undefined
+
+    commonEntries =
+        [ Entry ("Name:  " <> itName it) (dmenuSelect [] "Name" (itName it) >>= \t -> handleEditItemView env it{itName = t})
+        , Entry
+            ("Folder: " <> orNone (itFolderId it))
+            ( getFolders env
+                >>= \folders ->
+                    dmenuSelect [] "Folder" (Text.unlines (map (unFolder . coerce) folders))
+                        >>= \t -> handleEditItemView env it{itFolderId = Just t}
+            )
+        , Entry ("Notes: " <> maybe "<Enter to add>" (const "<Enter to edit>") (itNotes it)) (openInEditor (fromMaybe "" (itNotes it)) >>= \t -> handleEditItemView env it{itNotes = Just t})
+        ]
+
+    orNone :: Maybe Text -> Text
+    orNone = fromMaybe "None"
+
+    loginEntries :: Login -> [Entry ()]
+    loginEntries l@(Login uris name _pw totp) =
+        [ Entry ("Username: " <> orNone name) (dmenuSelect [] "Username" (orNone name) >>= \t -> handleEditItemView env it{itItem = ItemLogin l{loginUsername = Just t}})
+        , Entry "Password: ********" (generatePassword env >>= \t -> handleEditItemView env it{itItem = ItemLogin l{loginPassword = Just t}})
+        , Entry
+            "URLs: <Enter to edit>"
+            ( do
+                url <- dmenuSelect [] "URL (type to add new)" (Text.unlines (maybe [] coerce uris))
+                case find ((== url) . unUri) (fromMaybe [] uris) of
+                    Just oldUrl -> dmenuSelect [] "URL" (coerce oldUrl) >>= \newUrl -> handleEditItemView env it{itItem = ItemLogin (l{loginUris = Just (Uri newUrl : filter (/= oldUrl) (fromMaybe [] uris))})}
+                    Nothing -> handleEditItemView env it{itItem = ItemLogin (l{loginUris = Just (Uri url : fromMaybe [] uris)})}
+            )
+        , Entry ("TOTP: " <> orNone totp) (dmenuShow "TODO")
+        ]
 
 entriesToMap :: [Entry a] -> Map.Map Text (Sh a)
 entriesToMap = Map.fromList . map (\e -> (entryLabel e, entryRun e))
@@ -148,29 +195,29 @@ entriesToMap = Map.fromList . map (\e -> (entryLabel e, entryRun e))
 runSelected :: Map.Map Text (Sh a) -> Text -> Sh a
 runSelected actions selected = case Map.lookup selected actions of
     Just action -> action
-    Nothing     -> logId ("No such entry: " <> selected) >>= errorExit
+    Nothing     -> showExit ("No such entry: " <> selected)
 
 handleDashboardView :: ClientEnv -> [ItemTemplate] -> Sh ()
 handleDashboardView env items = do
     let allEntries = miscEntries <> itemEntries items dashboardAction
     let actions = entriesToMap allEntries
     dmenuSelect [] "Entries" (Text.unlines (map entryLabel allEntries))
-        >>= runSelected actions . head . Text.lines
+        >>= runSelected actions
   where
     miscEntries :: [Entry ()]
     miscEntries =
-        [ Entry Misc "View/Type individual entries" (handleAllItemsView env items)
-        , Entry Misc "View previous entry" (readCache >>= itemWithId items >>= handleItemView)
-        , Entry Misc "Edit entry (TODO)" (pure ())
-        , Entry Misc "Add entry (TODO)" (pure ())
-        , Entry Misc "Manage folders (TODO)" (pure ())
-        , Entry Misc "Manage collections (TODO)" (pure ())
-        , Entry Misc "Sync vault" (sync env)
-        , Entry Misc "Switch vaults (TODO)" (sync env)
-        , Entry Misc "Lock vault" (logout env)
+        [ Entry "View/Type individual entries" (handleAllItemsView items)
+        , Entry "View previous entry" (readCache >>= itemWithId items >>= handleItemView)
+        , Entry "Edit entry (TODO)" (handleEditItemsView env items)
+        , Entry "Add entry (TODO)" (pure ())
+        , Entry "Manage folders (TODO)" (pure ())
+        , Entry "Manage collections (TODO)" (pure ())
+        , Entry "Sync vault" (sync env)
+        , Entry "Switch vaults (TODO)" (sync env)
+        , Entry "Lock vault" (logout env)
         ]
 
-withCacheFile :: (FilePath -> Sh b) -> Sh b
+withCacheFile :: (FilePath -> Sh a) -> Sh a
 withCacheFile action = do
     maybeHome <- get_env "HOME"
     case maybeHome of
@@ -186,18 +233,31 @@ readCache = withCacheFile readfile
 itemWithId :: [ItemTemplate] -> Text -> Sh ItemTemplate
 itemWithId items id' = case find ((== id') . itId) items of
     Just x  -> pure x
-    Nothing -> errorExit "Could not find the previous item"
+    Nothing -> showExit "Could not find the previous item" >>= errorExit
 
-handleAllItemsView :: ClientEnv -> [ItemTemplate] -> Sh ()
-handleAllItemsView env items = do
-    let allEntries = itemEntries items (handleView env . ItemView)
+handleAllItemsView :: [ItemTemplate] -> Sh ()
+handleAllItemsView items = do
+    let allEntries = itemEntries items (\i -> writeCache (itId i) >> handleItemView i)
     let actions = entriesToMap allEntries
     dmenuSelect [] "Entries" (Text.unlines (map entryLabel allEntries))
-        >>= runSelected actions . head . Text.lines
+        >>= runSelected actions
+
+handleEditItemsView :: ClientEnv -> [ItemTemplate] -> Sh ()
+handleEditItemsView env items = do
+    let allEntries = itemEntries items (handleEditItemView env)
+    dmenuSelect [] "Entries" (Text.unlines (map entryLabel allEntries))
+        >>= runSelected (entriesToMap allEntries)
+
+handleEditItemView :: ClientEnv -> ItemTemplate -> Sh ()
+handleEditItemView env item = do
+    dmenuSelect [] "Entry" (Text.unlines (map entryLabel entries))
+        >>= runSelected (entriesToMap entries)
+  where
+    entries = individualEditItemEntries env item
 
 itemEntries :: [ItemTemplate] -> (ItemTemplate -> Sh ()) -> [Entry ()]
 itemEntries xs action =
-    [ Entry Item (toEntry' (i, x)) (action x)
+    [ Entry (toEntry' (i, x)) (action x)
     | (i, x) <- [1 :: Int ..] `zip` xs
     ]
   where
@@ -209,29 +269,15 @@ itemEntries xs action =
     width :: [a] -> Int
     width = length . show . length
 
-handleView :: ClientEnv -> View -> Sh ()
-handleView env view = case view of
-    DashboardView items -> handleDashboardView env items
-    AllItemsView items -> handleAllItemsView env items
-    ItemView item -> do
-        maybeHome <- get_env "HOME"
-        case maybeHome of
-            Just home -> writefile (fromText $ home <> "/.cache/hwarden") (itId item)
-            Nothing -> return ()
-        handleItemView item
-
 handleItemView :: ItemTemplate -> Sh ()
 handleItemView item =
     dmenuSelect [] "Entry" (Text.unlines (map entryLabel entries))
-        >>= runSelected (entriesToMap entries) . head . Text.lines
+        >>= runSelected (entriesToMap entries)
   where
     entries = individualItemEntries item
-data ActionLevel = Misc | Meta | Item
-    deriving (Show, Eq, Ord)
 
 data Entry a = Entry
-    { entryLevel :: ActionLevel
-    , entryLabel :: Text
+    { entryLabel :: Text
     , entryRun   :: Sh a
     }
 
@@ -246,12 +292,11 @@ and then exit the program.
 handleClientError :: ClientError -> Sh a
 handleClientError clientError =
     case clientError of
-        (DecodeFailure df _)           -> dmenuShow "Decode failure" >> pure df
-        (ConnectionError _)            -> logId "Connection error"
-        (UnsupportedContentType _ res) -> log "Unsupported content type" res
-        (InvalidContentTypeHeader res) -> log "Invalid content type header" res
-        (FailureResponse _ res)        -> logId (reason res)
-        >>= errorExit
+        (DecodeFailure df _) -> dmenuShow "Decode failure" >> errorExit df
+        (ConnectionError _) -> showExit "Connection error"
+        (UnsupportedContentType _ res) -> showResponseExit "Unsupported content type" res
+        (InvalidContentTypeHeader res) -> showResponseExit "Invalid content type header" res
+        (FailureResponse _ res) -> showExit (reason res)
   where
     reason :: Response -> Text
     reason =
@@ -260,14 +305,16 @@ handleClientError clientError =
             . decode @VaultFailureResponse
             . responseBody
 
-logId :: Text -> Sh Text
-logId err = dmenuShow err >> pure err
+showExit :: Text -> Sh a
+showExit t = dmenuShow t >> errorExit t
 
-log :: Text -> Response -> Sh Text
-log err full = dmenuShow err >> pure (err <> ":" <> Text.pack (show (responseBody full)))
+showResponseExit :: Text -> Response -> Sh a
+showResponseExit err full =
+    dmenuShow err
+        >> errorExit (err <> ":" <> Text.pack (show (responseBody full)))
 
 askPassword :: Sh Password
-askPassword = Password <$> run "dmenu" args
+askPassword = silently $ Password . head . Text.lines <$> run "dmenu" args
   where
     obscureColor = "#222222"
     args = ["-p", "Enter Password ", "-nb", obscureColor, "-nf", obscureColor]
@@ -290,11 +337,35 @@ sync env = callApi sync' env >>= dmenuShow . unTitledData
   where
     sync' = vaultClient // miscEp // syncEp
 
+generatePassword :: ClientEnv -> Sh Text
+generatePassword env = do
+    method <- dmenuSelect [] "Method" (Text.unlines ["Generate", "Manual"])
+    case head (Text.lines method) of
+        "Generate" -> do
+            len <- dmenuSelect [] "Length" "20"
+            special <- dmenuSelect [] "Include special?" (Text.unlines ["Yes", "No"])
+            case readMaybe @Int (Text.unpack len) of
+                Nothing -> showExit "Invalid length"
+                Just len' -> do
+                    let gen spec = callApi (generatePassword' (Just len') False False False spec) env <&> unGenerateData
+                    case head (Text.lines special) of
+                        "Yes" -> gen True
+                        "No"  -> gen False
+                        _     -> showExit "Please choose Yes or No"
+        "Manual" -> dmenuSelect [] "Password" ""
+        _ -> showExit "Please choose Generate or Manual"
+  where
+    generatePassword' :: Maybe Int -> Bool -> Bool -> Bool -> Bool -> ClientM (VaultResponse GenerateData)
+    generatePassword' = vaultClient // miscEp // generatePasswordEp
+
 getItems :: ClientEnv -> Sh [ItemTemplate]
 getItems = fmap coerce . callApi (vaultClient // itemsEp // getItemsEp)
 
 getStatus :: ClientEnv -> Sh StatusData
 getStatus = callApi (vaultClient // miscEp // statusEp)
+
+getFolders :: ClientEnv -> Sh [Folder]
+getFolders = fmap coerce . callApi (vaultClient // foldersEp // getFoldersEp)
 
 callApi :: ClientM (VaultResponse a) -> ClientEnv -> Sh a
 callApi action env =
@@ -310,6 +381,7 @@ type Todo = PostNoContent
 data VaultApi as = VaultApi
     { lockingEp :: as :- NamedRoutes VaultLockApi
     , itemsEp   :: as :- NamedRoutes VaultItemsApi
+    , foldersEp :: as :- NamedRoutes VaultFoldersApi
     , miscEp    :: as :- NamedRoutes VaultMiscellaneousApi
     }
     deriving stock (Generic)
@@ -378,9 +450,23 @@ data VaultItemsApi as = VaultItemsApi
     }
     deriving stock (Generic)
 
+newtype VaultFoldersApi as = VaultFoldersApi
+    { getFoldersEp :: as :- "list" :> "object" :> "folders" :> Get '[JSON] (VaultResponse FoldersData)
+    }
+    deriving stock (Generic)
+
 data VaultMiscellaneousApi as = VaultMiscellaneousApi
     { statusEp :: as :- "status" :> Get '[JSON] (VaultResponse StatusData)
-    , syncEp   :: as :- "sync" :> Post '[JSON] (VaultResponse TitledData)
+    , syncEp :: as :- "sync" :> Post '[JSON] (VaultResponse TitledData)
+    , generatePasswordEp ::
+        as
+            :- "generate"
+                :> QueryParam "length" Int
+                :> QueryFlag "uppercase"
+                :> QueryFlag "lowercase"
+                :> QueryFlag "number"
+                :> QueryFlag "special"
+                :> Get '[JSON] (VaultResponse GenerateData)
     }
     deriving stock (Generic)
 
@@ -419,7 +505,8 @@ newtype ItemsData = ItemsData
     deriving stock (Show, Eq)
 
 instance FromJSON ItemsData where
-    parseJSON = withObject "ItemsData" $ \o -> ItemsData <$> o .: "data"
+    parseJSON = withObject "ItemsData" $
+        \o -> ItemsData <$> o .: "data"
 
 data Item
     = ItemLogin Login
@@ -427,6 +514,15 @@ data Item
     | ItemSecureNote SecureNote
     | ItemIdentity Identity
     deriving stock (Show, Eq, Ord)
+
+newtype GenerateData = GenerateData
+    { unGenerateData :: Text
+    }
+    deriving stock (Show, Eq)
+
+instance FromJSON GenerateData where
+    parseJSON = withObject "GenerateData" $
+        \o -> GenerateData <$> o .: "data"
 
 toSymbol :: Item -> Text
 toSymbol = \case
@@ -448,6 +544,21 @@ instance ToEntry ItemTemplate where
 
 merge :: [Text] -> Text
 merge = mconcat . intersperse " - "
+
+instance FromJSON Folder where
+    parseJSON = withObject "Folder" $ \o -> Folder <$> o .: "name"
+
+newtype FoldersData = FoldersData
+    { unFoldersData :: [Folder]
+    }
+    deriving stock (Show, Eq)
+
+instance FromJSON FoldersData where
+    parseJSON = withObject "FoldersData" $ \o -> FoldersData <$> o .: "data"
+newtype Folder = Folder
+    { unFolder :: Text
+    }
+    deriving (Show, Eq)
 
 data ItemTemplate = ItemTemplate
     { itId       :: Text
