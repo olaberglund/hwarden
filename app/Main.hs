@@ -7,13 +7,15 @@
 
 module Main where
 
+import           Control.Arrow       (first)
 import           Control.Monad       (replicateM_, void, when, (>=>))
 import           Data.Aeson          (FromJSON (parseJSON), ToJSON (toJSON),
                                       decode, object, withObject, withText,
                                       (.:), (.:?), (.=))
 import           Data.Coerce         (coerce)
-import           Data.Functor        (($>), (<&>))
+import           Data.Functor        ((<&>))
 import           Data.List           (find, intersperse)
+import           Data.Map            (Map)
 import qualified Data.Map            as Map
 import           Data.Maybe          (catMaybes, fromMaybe)
 import           Data.Ord            (comparing)
@@ -30,12 +32,11 @@ import           Servant.Client      (AsClientT, ClientEnv, ClientError (..),
                                       ClientM, Response, client, mkClientEnv,
                                       parseBaseUrl, responseBody, runClientM,
                                       (//))
-import           Shelly              (Sh, errorExit, fromText, get_env, liftIO,
-                                      readfile, run, run_, setStdin, shelly,
-                                      silently, toTextIgnore, withTmpDir,
-                                      writefile, (<.>))
+import           Shelly              (Sh, errorExit, exit, fromText, get_env,
+                                      liftIO, readfile, run, run_, setStdin,
+                                      shelly, silently, toTextIgnore,
+                                      withTmpDir, writefile, (<.>))
 import           Text.Read           (readMaybe)
-import qualified Text.Read           as Text
 
 default (Text)
 
@@ -72,35 +73,6 @@ pressKey key = xdotool ["key", key]
 xdotool :: [Text] -> Sh ()
 xdotool = run_ "xdotool"
 
-dashboardAction :: ItemTemplate -> Sh ()
-dashboardAction i = case itItem i of
-    ItemIdentity _ -> paste "identity"
-    ItemSecureNote _ -> case itNotes i of
-        Just n  -> openInEditor_ n
-        Nothing -> dmenuShow "No note"
-    ItemCard (Card{..}) ->
-        openInEditor_ (Text.unlines [cardHolderName, cardNumber, cardCode])
-    ItemLogin (Login{..}) -> case (loginUsername, loginPassword) of
-        (Just u, Just p) -> do
-            paste u
-            pressKey "Tab"
-            paste p
-            replicateM_ 2 (pressKey "Return")
-        _ -> dmenuShow "No username or password"
-
-openInEditor_ :: Text -> Sh ()
-openInEditor_ = void . openInEditor
-
-openInEditor :: Text -> Sh Text
-openInEditor text = do
-    editor <- get_env "EDITOR"
-    case editor of
-        Nothing -> errorExit "EDITOR not set"
-        Just e -> withTmpDir $ \fp -> do
-            writefile (fp <.> "hwarden") text
-            run_ "st" [e, toTextIgnore (fp <.> "hwarden")]
-            readfile (fp <.> "hwarden")
-
 individualItemEntries :: ItemTemplate -> [Entry ()]
 individualItemEntries it =
     commonEntries <> case itItem it of
@@ -110,7 +82,7 @@ individualItemEntries it =
         ItemIdentity _ident -> []
   where
     commonEntries =
-        [ Entry ("Name:  " <> itName it) (pure ())
+        [ Entry ("Name:  " <> itTitle it) (pure ())
         , Entry ("Folder: " <> orNone (itFolderId it)) (pure ())
         , Entry ("Notes: " <> orNone (itNotes it)) (pure ())
         ]
@@ -160,15 +132,27 @@ individualEditItemEntries env it =
         _           -> undefined
 
     commonEntries =
-        [ Entry ("Name:  " <> itName it) (dmenuSelect [] "Name" (itName it) >>= \t -> handleEditItemView env it{itName = t})
+        [ Entry
+            ("Name: " <> itTitle it)
+            ( do
+                name <- dmenuSelect [] "Name" (itTitle it)
+                handleEditItemView env it{itTitle = name}
+            )
         , Entry
             ("Folder: " <> orNone (itFolderId it))
-            ( getFolders env
-                >>= \folders ->
-                    dmenuSelect [] "Folder" (Text.unlines (map (unFolder . coerce) folders))
-                        >>= \t -> handleEditItemView env it{itFolderId = Just t}
+            ( do
+                folders <- getFolders env
+                folderId <- dmenuSelect [] "Folder" (Text.unlines (coerce folders))
+                handleEditItemView env it{itFolderId = Just folderId}
             )
-        , Entry ("Notes: " <> maybe "<Enter to add>" (const "<Enter to edit>") (itNotes it)) (openInEditor (fromMaybe "" (itNotes it)) >>= \t -> handleEditItemView env it{itNotes = Just t})
+        , Entry
+            ("Notes: " <> maybe "<Enter to add>" (const "<Enter to edit>") (itNotes it))
+            ( do
+                note <- openInEditor (fromMaybe "" (itNotes it))
+                handleEditItemView env it{itNotes = Just note}
+            )
+        , Entry "Delete entry" (dmenuShow "TODO")
+        , Entry "Save entry" (dmenuShow "TODO")
         ]
 
     orNone :: Maybe Text -> Text
@@ -176,46 +160,53 @@ individualEditItemEntries env it =
 
     loginEntries :: Login -> [Entry ()]
     loginEntries l@(Login uris name _pw totp) =
-        [ Entry ("Username: " <> orNone name) (dmenuSelect [] "Username" (orNone name) >>= \t -> handleEditItemView env it{itItem = ItemLogin l{loginUsername = Just t}})
-        , Entry "Password: ********" (generatePassword env >>= \t -> handleEditItemView env it{itItem = ItemLogin l{loginPassword = Just t}})
+        [ Entry
+            ("Username: " <> orNone name)
+            ( do
+                un <- dmenuSelect [] "Username" (orNone name)
+                handleEditItemView env it{itItem = ItemLogin l{loginUsername = Just un}}
+            )
+        , Entry
+            "Password: ********"
+            ( do
+                pw <- generatePassword env
+                handleEditItemView env it{itItem = ItemLogin l{loginPassword = Just pw}}
+            )
         , Entry
             "URLs: <Enter to edit>"
             ( do
                 url <- dmenuSelect [] "URL (type to add new)" (Text.unlines (maybe [] coerce uris))
                 case find ((== url) . unUri) (fromMaybe [] uris) of
-                    Just oldUrl -> dmenuSelect [] "URL" (coerce oldUrl) >>= \newUrl -> handleEditItemView env it{itItem = ItemLogin (l{loginUris = Just (Uri newUrl : filter (/= oldUrl) (fromMaybe [] uris))})}
-                    Nothing -> handleEditItemView env it{itItem = ItemLogin (l{loginUris = Just (Uri url : fromMaybe [] uris)})}
+                    Just oldUrl -> do
+                        newUrl <- dmenuSelect [] "URL" (coerce oldUrl)
+                        handleEditItemView
+                            env
+                            it{itItem = ItemLogin (l{loginUris = Just (Uri newUrl : filter (/= oldUrl) (fromMaybe [] uris))})}
+                    Nothing ->
+                        handleEditItemView
+                            env
+                            it{itItem = ItemLogin (l{loginUris = Just (Uri url : fromMaybe [] uris)})}
             )
         , Entry ("TOTP: " <> orNone totp) (dmenuShow "TODO")
         ]
 
-entriesToMap :: [Entry a] -> Map.Map Text (Sh a)
-entriesToMap = Map.fromList . map (\e -> (entryLabel e, entryRun e))
-
-runSelected :: Map.Map Text (Sh a) -> Text -> Sh a
-runSelected actions selected = case Map.lookup selected actions of
-    Just action -> action
-    Nothing     -> showExit ("No such entry: " <> selected)
-
 handleDashboardView :: ClientEnv -> [ItemTemplate] -> Sh ()
-handleDashboardView env items = do
-    let allEntries = miscEntries <> itemEntries items dashboardAction
-    let actions = entriesToMap allEntries
-    dmenuSelect [] "Entries" (Text.unlines (map entryLabel allEntries))
-        >>= runSelected actions
+handleDashboardView env items = handleView "Entries" allEntries
   where
     miscEntries :: [Entry ()]
     miscEntries =
         [ Entry "View/Type individual entries" (handleAllItemsView items)
         , Entry "View previous entry" (readCache >>= itemWithId items >>= handleItemView)
-        , Entry "Edit entry (TODO)" (handleEditItemsView env items)
+        , Entry "Edit entry (WIP)" (handleEditItemsView env items)
         , Entry "Add entry (TODO)" (pure ())
         , Entry "Manage folders (TODO)" (pure ())
         , Entry "Manage collections (TODO)" (pure ())
+        , Entry "Switch vaults (TODO)" (pure ())
         , Entry "Sync vault" (sync env)
-        , Entry "Switch vaults (TODO)" (sync env)
         , Entry "Lock vault" (logout env)
         ]
+
+    allEntries = miscEntries <> itemEntries items dashboardAction
 
 withCacheFile :: (FilePath -> Sh a) -> Sh a
 withCacheFile action = do
@@ -236,24 +227,35 @@ itemWithId items id' = case find ((== id') . itId) items of
     Nothing -> showExit "Could not find the previous item" >>= errorExit
 
 handleAllItemsView :: [ItemTemplate] -> Sh ()
-handleAllItemsView items = do
-    let allEntries = itemEntries items (\i -> writeCache (itId i) >> handleItemView i)
-    let actions = entriesToMap allEntries
-    dmenuSelect [] "Entries" (Text.unlines (map entryLabel allEntries))
-        >>= runSelected actions
+handleAllItemsView items = handleView "Entries" entries
+  where
+    entries = itemEntries items (\i -> writeCache (itId i) >> handleItemView i)
 
 handleEditItemsView :: ClientEnv -> [ItemTemplate] -> Sh ()
-handleEditItemsView env items = do
-    let allEntries = itemEntries items (handleEditItemView env)
-    dmenuSelect [] "Entries" (Text.unlines (map entryLabel allEntries))
-        >>= runSelected (entriesToMap allEntries)
+handleEditItemsView env items = handleView "Entries" entries
+  where
+    entries = itemEntries items (handleEditItemView env)
 
 handleEditItemView :: ClientEnv -> ItemTemplate -> Sh ()
-handleEditItemView env item = do
-    dmenuSelect [] "Entry" (Text.unlines (map entryLabel entries))
-        >>= runSelected (entriesToMap entries)
+handleEditItemView env item = handleView "Entry" entries
   where
     entries = individualEditItemEntries env item
+
+handleItemView :: ItemTemplate -> Sh ()
+handleItemView item = handleView "Entry" (individualItemEntries item)
+
+handleView :: forall a. Text -> [Entry a] -> Sh a
+handleView prompt entries =
+    dmenuSelect [] prompt (Text.unlines (map entryLabel entries))
+        >>= runSelected
+  where
+    runSelected :: Text -> Sh a
+    runSelected selected = case Map.lookup selected (entriesToMap entries) of
+        Just action -> action
+        Nothing     -> showExit ("No such entry: " <> selected)
+
+    entriesToMap :: [Entry a] -> Map.Map Text (Sh a)
+    entriesToMap = Map.fromList . map (\e -> (entryLabel e, entryRun e))
 
 itemEntries :: [ItemTemplate] -> (ItemTemplate -> Sh ()) -> [Entry ()]
 itemEntries xs action =
@@ -268,13 +270,6 @@ itemEntries xs action =
 
     width :: [a] -> Int
     width = length . show . length
-
-handleItemView :: ItemTemplate -> Sh ()
-handleItemView item =
-    dmenuSelect [] "Entry" (Text.unlines (map entryLabel entries))
-        >>= runSelected (entriesToMap entries)
-  where
-    entries = individualItemEntries item
 
 data Entry a = Entry
     { entryLabel :: Text
@@ -328,19 +323,19 @@ login env pw =
     unlock = vaultClient // lockingEp // unlockEp
 
 logout :: ClientEnv -> Sh ()
-logout env = callApi lock env >>= dmenuShow . unTitledData
+logout env = callApi lock env >>= dmenuShow . coerce
   where
     lock = vaultClient // lockingEp // lockEp
 
 sync :: ClientEnv -> Sh ()
-sync env = callApi sync' env >>= dmenuShow . unTitledData
+sync env = callApi sync' env >>= dmenuShow . coerce
   where
     sync' = vaultClient // miscEp // syncEp
 
 generatePassword :: ClientEnv -> Sh Text
 generatePassword env = do
     method <- dmenuSelect [] "Method" (Text.unlines ["Generate", "Manual"])
-    case head (Text.lines method) of
+    case method of
         "Generate" -> do
             len <- dmenuSelect [] "Length" "20"
             special <- dmenuSelect [] "Include special?" (Text.unlines ["Yes", "No"])
@@ -563,14 +558,14 @@ newtype Folder = Folder
 data ItemTemplate = ItemTemplate
     { itId       :: Text
     , itFolderId :: Maybe Text
-    , itName     :: Text
+    , itTitle    :: Text
     , itNotes    :: Maybe Text
     , itItem     :: Item
     }
     deriving (Show, Eq)
 
 instance Ord ItemTemplate where
-    compare = comparing itItem <> comparing itName
+    compare = comparing itItem <> comparing itTitle
 
 newtype Uri = Uri
     { unUri :: Text
@@ -629,3 +624,290 @@ instance FromJSON ItemTemplate where
             3 -> item . ItemCard <$> o .: "card"
             4 -> item . ItemIdentity <$> o .: "identity"
             _ -> fail "Invalid item type"
+
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+------------------------------------
+
+data Arg = Obscured
+
+newtype Error = Error Text
+
+data Interaction
+    = InteractionQuestion Question
+    | InteractionEnd
+
+newtype Prompt = Prompt
+    { unPrompt :: Text
+    }
+
+data Question = Question
+    { questionPrompt  :: Prompt
+    , questionOptions :: Map Option Interaction
+    }
+
+data Option
+    = OptionDashboard Dashboard
+    | OptionTypeItems ItemTemplate
+    | Manual Text
+    deriving (Show, Eq, Ord)
+
+data Dashboard
+    = DashboardViewAll
+    | DashboardSync
+    | DashboardLockVault
+    | DashboardEntry ItemTemplate
+    deriving (Show, Eq, Ord)
+
+toText :: Option -> Text
+toText (OptionTypeItems it) = itTitle it
+toText (Manual entry) = entry
+toText (OptionDashboard d) = case d of
+    DashboardViewAll   -> "View/Type individual entries"
+    DashboardSync      -> "Sync vault"
+    DashboardLockVault -> "Lock vault"
+    DashboardEntry it  -> itTitle it
+
+loginI :: Interaction
+loginI =
+    InteractionQuestion
+        ( Question
+            { questionPrompt = Prompt "Enter Password"
+            , questionOptions = Map.empty
+            }
+        )
+
+dashboardI :: [ItemTemplate] -> Interaction
+dashboardI items =
+    InteractionQuestion
+        ( Question
+            { questionPrompt = Prompt "Entries"
+            , questionOptions =
+                Map.fromList $
+                    first OptionDashboard
+                        <$> [ (DashboardViewAll, itemsI items)
+                            , (DashboardSync, InteractionEnd)
+                            , (DashboardLockVault, InteractionEnd)
+                            ]
+                            <> map ((,InteractionEnd) . DashboardEntry) items
+            }
+        )
+
+itemsI :: [ItemTemplate] -> Interaction
+itemsI items =
+    InteractionQuestion
+        ( Question
+            { questionPrompt = Prompt "Entries"
+            , questionOptions =
+                Map.fromList
+                    (map ((,InteractionEnd) . OptionTypeItems) items)
+            }
+        )
+
+main2 :: IO ()
+main2 = do
+    manager <- newManager defaultManagerSettings
+    baseUrl <- parseBaseUrl "http://localhost:8087"
+    let env = mkClientEnv manager baseUrl
+    shelly $ do
+        status <- getStatus env
+
+        when (statusDataStatus status == Locked) $
+            void $
+                menuRunLogin dmenu >>= login env
+
+        items <- getItems env
+
+        runInteraction dmenu env (dashboardI items)
+
+runInteraction :: Menu -> ClientEnv -> Interaction -> Sh ()
+runInteraction _ _ InteractionEnd = exit 0
+runInteraction menu env (InteractionQuestion q) = do
+    sel <- menuRunQuestion menu q
+
+    let continue = case sel `Map.lookup` questionOptions q of
+            Just answer -> runInteraction menu env answer
+            Nothing     -> errorExit "Invalid selection"
+
+    case sel of
+        OptionDashboard d -> case d of
+            DashboardSync       -> sync env >> exit 0
+            DashboardLockVault  -> logout env >> exit 0
+            DashboardEntry item -> dashboardAction item >> exit 0
+            _                   -> continue
+        _ -> continue
+
+getItems' :: ClientEnv -> IO [ItemTemplate]
+getItems' = fmap coerce . callApi' (vaultClient // itemsEp // getItemsEp)
+
+callApi' :: ClientM (VaultResponse a) -> ClientEnv -> IO a
+callApi' action env =
+    liftIO (runClientM action env) >>= \case
+        Left e -> print e >> undefined
+        Right (VaultResponse res) -> pure res
+
+data Menu = Menu
+    { menuRunQuestion :: Question -> Sh Option
+    , menuRunLogin    :: Sh Password
+    }
+
+dmenu :: Menu
+dmenu = Menu dmenuQ dmenuP
+
+dmenuP :: Sh Password
+dmenuP = silently $ Password . head . Text.lines <$> run "dmenu" args
+  where
+    obscureColor = "#222222"
+    args = ["-p", "Enter Password ", "-nb", obscureColor, "-nf", obscureColor]
+
+dmenuQ :: Question -> Sh Option
+dmenuQ (Question prompt options) = do
+    let textOptions = toText <$> Map.keys options
+    let ls = Text.unlines textOptions
+    let optionMap = Map.fromList (zip textOptions (Map.keys options))
+    let lenLines = Text.pack (show (min 24 (length (Text.lines ls))))
+
+    setStdin ls
+    sel <- run "dmenu" ["-i", "-l", lenLines, "-p", coerce prompt]
+    case Map.lookup (head (Text.lines sel)) optionMap of
+        Just o  -> pure o
+        Nothing -> errorExit "Invalid selection"
+
+dashboardAction :: ItemTemplate -> Sh ()
+dashboardAction i = case itItem i of
+    ItemIdentity _ -> paste "identity"
+    ItemSecureNote _ -> case itNotes i of
+        Just n  -> openInEditor_ n
+        Nothing -> dmenuShow "No note"
+    ItemCard (Card{..}) ->
+        openInEditor_ (Text.unlines [cardHolderName, cardNumber, cardCode])
+    ItemLogin (Login{..}) -> case (loginUsername, loginPassword) of
+        (Just u, Just p) -> do
+            paste u
+            pressKey "Tab"
+            paste p
+            replicateM_ 2 (pressKey "Return")
+        _ -> dmenuShow "No username or password"
+
+openInEditor_ :: Text -> Sh ()
+openInEditor_ = void . openInEditor
+
+openInEditor :: Text -> Sh Text
+openInEditor text = do
+    editor <- get_env "EDITOR"
+    case editor of
+        Nothing -> errorExit "EDITOR not set"
+        Just e -> withTmpDir $ \fp -> do
+            writefile (fp <.> "hwarden") text
+            run_ "st" [e, toTextIgnore (fp <.> "hwarden")]
+            readfile (fp <.> "hwarden")
