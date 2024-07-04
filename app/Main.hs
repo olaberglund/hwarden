@@ -14,7 +14,7 @@ import           Data.Aeson          (FromJSON (parseJSON), ToJSON (toJSON),
                                       (.:), (.:?), (.=))
 import           Data.Coerce         (coerce)
 import           Data.Functor        ((<&>))
-import           Data.List           (find, intersperse)
+import           Data.List           (find, foldl', intersperse)
 import           Data.Map            (Map)
 import qualified Data.Map            as Map
 import           Data.Maybe          (catMaybes, fromMaybe)
@@ -739,7 +739,7 @@ instance FromJSON ItemTemplate where
 ------------------------------------
 ------------------------------------
 
-data Arg = Obscured
+data Arg = ArgObscured | ArgPrompt Text
 
 newtype Error = Error Text
 
@@ -747,19 +747,32 @@ data Interaction
     = InteractionQuestion Question
     | InteractionEnd
 
-newtype Prompt = Prompt
-    { unPrompt :: Text
-    }
+newtype Prompt = Prompt {unPrompt :: [Arg]}
 
 data Question = Question
-    { questionPrompt  :: Prompt
-    , questionOptions :: Map Option Interaction
+    { questionPrompt        :: !Prompt
+    , questionContinuations :: !(Map Option Interaction)
+    , questionContext       :: !Context
     }
+
+data Context
+    = ContextLogin
+    | ContextDashboard
+    | ContextAllItems
+    | ContextAnnouncement
+    | ContextViewIndividualItem
 
 data Option
     = OptionDashboard Dashboard
-    | OptionTypeItems ItemTemplate
-    | Manual Text
+    | OptionIndividualItem IndividualItem
+    | OptionFreeHand Text
+    | OptionAllItems ItemTemplate
+    deriving (Show, Eq, Ord)
+
+data IndividualItem
+    = IndividualItemPasteTitle Text
+    | IndividualItemOpenEditorNotes (Maybe Text)
+    | IndividualItemDoNothingFolder (Maybe Text)
     deriving (Show, Eq, Ord)
 
 data Dashboard
@@ -770,20 +783,56 @@ data Dashboard
     deriving (Show, Eq, Ord)
 
 toText :: Option -> Text
-toText (OptionTypeItems it) = itTitle it
-toText (Manual entry) = entry
+toText (OptionFreeHand _) = ""
 toText (OptionDashboard d) = case d of
     DashboardViewAll   -> "View/Type individual entries"
     DashboardSync      -> "Sync vault"
     DashboardLockVault -> "Lock vault"
-    DashboardEntry it  -> itTitle it
+    DashboardEntry it  -> toEntry it
+toText (OptionIndividualItem action) = case action of
+    IndividualItemDoNothingFolder t -> "Folder: " <> maybe "None" (head . Text.lines) t
+    IndividualItemOpenEditorNotes t -> "Notes: " <> maybe "None" (head . Text.lines) t
+    IndividualItemPasteTitle t -> "Title: " <> t
+toText (OptionAllItems it) = toEntry it
+
+viewItemI :: ItemTemplate -> Interaction
+viewItemI item =
+    InteractionQuestion
+        ( Question
+            { questionPrompt = Prompt [ArgPrompt "Entry"]
+            , questionContinuations = Map.fromList (itemContinuations item)
+            , questionContext = ContextViewIndividualItem
+            }
+        )
+
+allItemsI :: [ItemTemplate] -> Interaction
+allItemsI items =
+    InteractionQuestion
+        ( Question
+            { questionPrompt = Prompt [ArgPrompt "Entries"]
+            , questionContinuations =
+                Map.fromList $ map (\it -> (OptionAllItems it, viewItemI it)) items
+            , questionContext = ContextAllItems
+            }
+        )
+
+itemContinuations :: ItemTemplate -> [(Option, Interaction)]
+itemContinuations item =
+    first OptionIndividualItem
+        <$> map
+            (,InteractionEnd)
+            [ IndividualItemPasteTitle (itTitle item)
+            , IndividualItemOpenEditorNotes (itNotes item)
+            , IndividualItemDoNothingFolder (itFolderId item)
+            ]
 
 loginI :: Interaction
 loginI =
     InteractionQuestion
         ( Question
-            { questionPrompt = Prompt "Enter Password"
-            , questionOptions = Map.empty
+            { questionPrompt = Prompt [ArgPrompt "Enter Password", ArgObscured]
+            , questionContinuations = Map.empty
+            , questionContext = ContextLogin
             }
         )
 
@@ -791,27 +840,26 @@ dashboardI :: [ItemTemplate] -> Interaction
 dashboardI items =
     InteractionQuestion
         ( Question
-            { questionPrompt = Prompt "Entries"
-            , questionOptions =
+            { questionPrompt = Prompt [ArgPrompt "Entries"]
+            , questionContinuations =
                 Map.fromList $
                     first OptionDashboard
-                        <$> [ (DashboardViewAll, itemsI items)
+                        <$> [ (DashboardViewAll, allItemsI items)
                             , (DashboardSync, InteractionEnd)
                             , (DashboardLockVault, InteractionEnd)
                             ]
                             <> map ((,InteractionEnd) . DashboardEntry) items
+            , questionContext = ContextDashboard
             }
         )
 
-itemsI :: [ItemTemplate] -> Interaction
-itemsI items =
+announceI :: Text -> Interaction
+announceI msg =
     InteractionQuestion
         ( Question
-            { questionPrompt = Prompt "Entries"
-            , questionOptions =
-                Map.fromList
-                    (map ((,InteractionEnd) . OptionTypeItems) items)
-            }
+            (Prompt [ArgPrompt msg])
+            Map.empty
+            ContextAnnouncement
         )
 
 main2 :: IO ()
@@ -819,36 +867,39 @@ main2 = do
     manager <- newManager defaultManagerSettings
     baseUrl <- parseBaseUrl "http://localhost:8087"
     let env = mkClientEnv manager baseUrl
+    let menu = Menu dmenu
     shelly $ do
         status <- getStatus env
 
         when (statusDataStatus status == Locked) $
-            void $
-                menuRunLogin dmenu >>= login env
+            silently $
+                runInteraction menu env loginI
 
         items <- getItems env
 
-        runInteraction dmenu env (dashboardI items)
+        runInteraction menu env (dashboardI items)
 
 runInteraction :: Menu -> ClientEnv -> Interaction -> Sh ()
 runInteraction _ _ InteractionEnd = exit 0
 runInteraction menu env (InteractionQuestion q) = do
-    sel <- menuRunQuestion menu q
+    sel <- coerce menu q
 
-    let continue = case sel `Map.lookup` questionOptions q of
-            Just answer -> runInteraction menu env answer
-            Nothing     -> errorExit "Invalid selection"
+    let continue = runInteraction menu env (questionContinuations q Map.! sel)
 
     case sel of
         OptionDashboard d -> case d of
-            DashboardSync       -> sync env >> exit 0
-            DashboardLockVault  -> logout env >> exit 0
-            DashboardEntry item -> dashboardAction item >> exit 0
+            DashboardSync       -> sync env
+            DashboardLockVault  -> logout env
+            DashboardEntry item -> dashboardAction item
             _                   -> continue
+        OptionFreeHand t -> case questionContext q of
+            ContextLogin -> void (login env (Password t))
+            ContextAnnouncement -> pure ()
+            _ -> runInteraction menu env (announceI "No such option")
         _ -> continue
 
 getItems' :: ClientEnv -> IO [ItemTemplate]
-getItems' = fmap coerce . callApi' (vaultClient // itemsEp // getItemsEp)
+getItems' = coerce . callApi' (vaultClient // itemsEp // getItemsEp)
 
 callApi' :: ClientM (VaultResponse a) -> ClientEnv -> IO a
 callApi' action env =
@@ -856,32 +907,29 @@ callApi' action env =
         Left e -> print e >> undefined
         Right (VaultResponse res) -> pure res
 
-data Menu = Menu
-    { menuRunQuestion :: Question -> Sh Option
-    , menuRunLogin    :: Sh Password
-    }
+newtype Menu = Menu {unMenu :: Question -> Sh Option}
 
-dmenu :: Menu
-dmenu = Menu dmenuQ dmenuP
-
-dmenuP :: Sh Password
-dmenuP = silently $ Password . head . Text.lines <$> run "dmenu" args
-  where
-    obscureColor = "#222222"
-    args = ["-p", "Enter Password ", "-nb", obscureColor, "-nf", obscureColor]
-
-dmenuQ :: Question -> Sh Option
-dmenuQ (Question prompt options) = do
+dmenu :: Question -> Sh Option
+dmenu (Question prompt options _context) = do
     let textOptions = toText <$> Map.keys options
     let ls = Text.unlines textOptions
     let optionMap = Map.fromList (zip textOptions (Map.keys options))
     let lenLines = Text.pack (show (min 24 (length (Text.lines ls))))
+    let obscureColor = "#222222"
+
+    let fromArg current arg =
+            current <> case arg of
+                ArgObscured -> ["-nb", obscureColor, "-nf", obscureColor]
+                ArgPrompt p -> ["-p", p]
+
+    let args = foldl' fromArg ["-i", "-l", lenLines] (unPrompt prompt)
 
     setStdin ls
-    sel <- run "dmenu" ["-i", "-l", lenLines, "-p", coerce prompt]
-    case Map.lookup (head (Text.lines sel)) optionMap of
-        Just o  -> pure o
-        Nothing -> errorExit "Invalid selection"
+    sel <- run "dmenu" args
+    let line = head (Text.lines sel)
+    pure $ case Map.lookup line optionMap of
+        Just o  -> o
+        Nothing -> OptionFreeHand line
 
 dashboardAction :: ItemTemplate -> Sh ()
 dashboardAction i = case itItem i of
