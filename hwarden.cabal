@@ -79,6 +79,7 @@ executable hwarden
     , shelly
     , text
     , time
+    , transformers
     , warp
 
   -- Directories containing source files.

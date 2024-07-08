@@ -7,62 +7,66 @@
 
 module Main where
 
-import           Control.Arrow       (first)
-import           Control.Monad       (replicateM_, void, when, (>=>))
-import           Data.Aeson          (FromJSON (parseJSON), ToJSON (toJSON),
-                                      decode, object, withObject, withText,
-                                      (.:), (.:?), (.=))
-import           Data.Coerce         (coerce)
-import           Data.Functor        ((<&>))
-import           Data.List           (find, foldl', intersperse)
-import           Data.Map            (Map)
-import qualified Data.Map            as Map
-import           Data.Maybe          (catMaybes, fromMaybe)
-import           Data.Ord            (comparing)
-import           Data.Text           (Text)
-import qualified Data.Text           as Text
-import           Data.Time           (UTCTime)
-import           GHC.Generics        (Generic)
-import           Network.HTTP.Client (defaultManagerSettings, newManager)
-import           Prelude             hiding (log)
-import           Servant             (Get, JSON, NamedRoutes, Post,
-                                      PostNoContent, Proxy (Proxy), QueryFlag,
-                                      QueryParam, ReqBody, (:-), (:>))
-import           Servant.Client      (AsClientT, ClientEnv, ClientError (..),
-                                      ClientM, Response, client, mkClientEnv,
-                                      parseBaseUrl, responseBody, runClientM,
-                                      (//))
-import           Shelly              (Sh, errorExit, exit, fromText, get_env,
-                                      liftIO, readfile, run, run_, setStdin,
-                                      shelly, silently, toTextIgnore,
-                                      withTmpDir, writefile, (<.>))
-import           Text.Read           (readMaybe)
+import           Control.Monad              (replicateM_, void, when, (>=>))
+import           Control.Monad.Trans.Class  (lift)
+import           Control.Monad.Trans.Reader (ReaderT, asks, mapReaderT,
+                                             runReaderT)
+import           Data.Aeson                 (FromJSON (parseJSON),
+                                             ToJSON (toJSON), decode, object,
+                                             withObject, withText, (.:), (.:?),
+                                             (.=))
+import           Data.Bifunctor             (bimap, first)
+import           Data.Coerce                (coerce)
+import           Data.List                  (find, foldl', intersperse)
+import qualified Data.Map                   as Map
+import           Data.Maybe                 (catMaybes, fromMaybe)
+import           Data.Ord                   (comparing)
+import           Data.Text                  (Text)
+import qualified Data.Text                  as Text
+import           Data.Time                  (UTCTime)
+import           GHC.Generics               (Generic)
+import           Network.HTTP.Client        (defaultManagerSettings, newManager)
+import           Prelude                    hiding (log)
+import           Servant                    (Get, JSON, NamedRoutes, Post,
+                                             PostNoContent, Proxy (Proxy),
+                                             QueryFlag, QueryParam, ReqBody,
+                                             (:-), (:>))
+import           Servant.Client             (AsClientT, ClientEnv,
+                                             ClientError (..), ClientM,
+                                             Response, client, mkClientEnv,
+                                             parseBaseUrl, responseBody,
+                                             runClientM, (//))
+import           Shelly                     (Sh, errorExit, exit, fromText,
+                                             get_env, liftIO, readfile, run,
+                                             run_, setStdin, shelly, silently,
+                                             toTextIgnore, withTmpDir,
+                                             writefile, (<.>))
+
+-- generatePassword :: ClientEnv -> Sh Text
+-- generatePassword env = do
+--     method <- dmenuSelect [] "Method" (Text.unlines ["Generate", "Manual"])
+--     case method of
+--         "Generate" -> do
+--             len <- dmenuSelect [] "Length" "20"
+--             special <- dmenuSelect [] "Include special?" (Text.unlines ["Yes", "No"])
+--             case readMaybe @Int (Text.unpack len) of
+--                 Nothing -> showExit "Invalid length"
+--                 Just len' -> do
+--                     let gen spec = callApi (generatePassword' (Just len') False False False spec) env <&> unGenerateData
+--                     case head (Text.lines special) of
+--                         "Yes" -> gen True
+--                         "No"  -> gen False
+--                         _     -> showExit "Please choose Yes or No"
+--         "Manual" -> dmenuSelect [] "Password" ""
+--         _ -> showExit "Please choose Generate or Manual"
+--   where
+--     generatePassword' :: Maybe Int -> Bool -> Bool -> Bool -> Bool -> ClientM (VaultResponse GenerateData)
+--     generatePassword' = vaultClient // miscEp // generatePasswordEp
 
 default (Text)
 
 class ToEntry a where
     toEntry :: a -> Text
-
-dmenuSelect :: [Text.Text] -> Text -> Text -> Sh Text
-dmenuSelect args p ls =
-    setStdin ls
-        >> run "dmenu" (["-i", "-l", Text.pack (show (min 24 (length (Text.lines ls)))), "-p", p] <> args)
-        <&> head . Text.lines
-
-main :: IO ()
-main = do
-    manager <- newManager defaultManagerSettings
-    baseUrl <- parseBaseUrl "http://localhost:8087"
-    let env = mkClientEnv manager baseUrl
-    shelly $ do
-        status <- getStatus env
-
-        when (statusDataStatus status == Locked) $
-            void $
-                askPassword >>= login env . Password . head . Text.lines . coerce
-
-        items <- getItems env
-        handleDashboardView env items
 
 paste :: Text -> Sh ()
 paste text = xdotool ["type", "--delay", "0", text]
@@ -72,141 +76,6 @@ pressKey key = xdotool ["key", key]
 
 xdotool :: [Text] -> Sh ()
 xdotool = run_ "xdotool"
-
-individualItemEntries :: ItemTemplate -> [Entry ()]
-individualItemEntries it =
-    commonEntries <> case itItem it of
-        ItemLogin l         -> loginEntries l
-        ItemCard c          -> cardEntries c
-        ItemSecureNote _    -> noteEntries it
-        ItemIdentity _ident -> []
-  where
-    commonEntries =
-        [ Entry ("Name:  " <> itTitle it) (pure ())
-        , Entry ("Folder: " <> orNone (itFolderId it)) (pure ())
-        , Entry ("Notes: " <> orNone (itNotes it)) (pure ())
-        ]
-
-    orNone :: Maybe Text -> Text
-    orNone = fromMaybe "None"
-
-    cardEntries :: Card -> [Entry ()]
-    cardEntries (Card _ number code) =
-        [ Entry ("CVV: " <> code) (paste code)
-        , Entry ("Number: " <> number) (paste number)
-        ]
-
-    orDoNothing = maybe (pure ())
-
-    loginEntries :: Login -> [Entry ()]
-    loginEntries (Login uris name pw totp) =
-        [ Entry ("Username: " <> orNone name) (orDoNothing paste name)
-        , Entry "Password: ********" (orDoNothing paste pw)
-        , Entry ("TOTP: " <> orNone totp) (pure ())
-        ]
-            <> maybe
-                []
-                ( map
-                    ( \(Uri uri, i) ->
-                        Entry ("URI " <> Text.pack (show i) <> ": " <> uri) (run_ "firefox" [uri])
-                    )
-                )
-                (zip <$> uris <*> pure [1 :: Int ..])
-    noteEntries :: ItemTemplate -> [Entry ()]
-    noteEntries item =
-        let lines' = Text.lines $ fromMaybe "" (itNotes item)
-         in catMaybes
-                [ Entry
-                    ("Note: " <> head lines' <> " (" <> Text.pack (show $ length lines') <> " lines)")
-                    . openInEditor_
-                    <$> itNotes item
-                ]
-
-individualEditItemEntries :: ClientEnv -> ItemTemplate -> [Entry ()]
-individualEditItemEntries env it =
-    commonEntries <> itemSpecificEntries
-  where
-    itemSpecificEntries :: [Entry ()]
-    itemSpecificEntries = case itItem it of
-        ItemLogin l -> loginEntries l
-        _           -> undefined
-
-    commonEntries =
-        [ Entry
-            ("Name: " <> itTitle it)
-            ( do
-                name <- dmenuSelect [] "Name" (itTitle it)
-                handleEditItemView env it{itTitle = name}
-            )
-        , Entry
-            ("Folder: " <> orNone (itFolderId it))
-            ( do
-                folders <- getFolders env
-                folderId <- dmenuSelect [] "Folder" (Text.unlines (coerce folders))
-                handleEditItemView env it{itFolderId = Just folderId}
-            )
-        , Entry
-            ("Notes: " <> maybe "<Enter to add>" (const "<Enter to edit>") (itNotes it))
-            ( do
-                note <- openInEditor (fromMaybe "" (itNotes it))
-                handleEditItemView env it{itNotes = Just note}
-            )
-        , Entry "Delete entry" (dmenuShow "TODO")
-        , Entry "Save entry" (dmenuShow "TODO")
-        ]
-
-    orNone :: Maybe Text -> Text
-    orNone = fromMaybe "None"
-
-    loginEntries :: Login -> [Entry ()]
-    loginEntries l@(Login uris name _pw totp) =
-        [ Entry
-            ("Username: " <> orNone name)
-            ( do
-                un <- dmenuSelect [] "Username" (orNone name)
-                handleEditItemView env it{itItem = ItemLogin l{loginUsername = Just un}}
-            )
-        , Entry
-            "Password: ********"
-            ( do
-                pw <- generatePassword env
-                handleEditItemView env it{itItem = ItemLogin l{loginPassword = Just pw}}
-            )
-        , Entry
-            "URLs: <Enter to edit>"
-            ( do
-                url <- dmenuSelect [] "URL (type to add new)" (Text.unlines (maybe [] coerce uris))
-                case find ((== url) . unUri) (fromMaybe [] uris) of
-                    Just oldUrl -> do
-                        newUrl <- dmenuSelect [] "URL" (coerce oldUrl)
-                        handleEditItemView
-                            env
-                            it{itItem = ItemLogin (l{loginUris = Just (Uri newUrl : filter (/= oldUrl) (fromMaybe [] uris))})}
-                    Nothing ->
-                        handleEditItemView
-                            env
-                            it{itItem = ItemLogin (l{loginUris = Just (Uri url : fromMaybe [] uris)})}
-            )
-        , Entry ("TOTP: " <> orNone totp) (dmenuShow "TODO")
-        ]
-
-handleDashboardView :: ClientEnv -> [ItemTemplate] -> Sh ()
-handleDashboardView env items = handleView "Entries" allEntries
-  where
-    miscEntries :: [Entry ()]
-    miscEntries =
-        [ Entry "View/Type individual entries" (handleAllItemsView items)
-        , Entry "View previous entry" (readCache >>= itemWithId items >>= handleItemView)
-        , Entry "Edit entry (WIP)" (handleEditItemsView env items)
-        , Entry "Add entry (TODO)" (pure ())
-        , Entry "Manage folders (TODO)" (pure ())
-        , Entry "Manage collections (TODO)" (pure ())
-        , Entry "Switch vaults (TODO)" (pure ())
-        , Entry "Sync vault" (sync env)
-        , Entry "Lock vault" (logout env)
-        ]
-
-    allEntries = miscEntries <> itemEntries items dashboardAction
 
 withCacheFile :: (FilePath -> Sh a) -> Sh a
 withCacheFile action = do
@@ -221,77 +90,14 @@ writeCache = withCacheFile . flip writefile
 readCache :: Sh Text
 readCache = withCacheFile readfile
 
-itemWithId :: [ItemTemplate] -> Text -> Sh ItemTemplate
-itemWithId items id' = case find ((== id') . itId) items of
-    Just x  -> pure x
-    Nothing -> showExit "Could not find the previous item" >>= errorExit
-
-handleAllItemsView :: [ItemTemplate] -> Sh ()
-handleAllItemsView items = handleView "Entries" entries
-  where
-    entries = itemEntries items (\i -> writeCache (itId i) >> handleItemView i)
-
-handleEditItemsView :: ClientEnv -> [ItemTemplate] -> Sh ()
-handleEditItemsView env items = handleView "Entries" entries
-  where
-    entries = itemEntries items (handleEditItemView env)
-
-handleEditItemView :: ClientEnv -> ItemTemplate -> Sh ()
-handleEditItemView env item = handleView "Entry" entries
-  where
-    entries = individualEditItemEntries env item
-
-handleItemView :: ItemTemplate -> Sh ()
-handleItemView item = handleView "Entry" (individualItemEntries item)
-
-handleView :: forall a. Text -> [Entry a] -> Sh a
-handleView prompt entries =
-    dmenuSelect [] prompt (Text.unlines (map entryLabel entries))
-        >>= runSelected
-  where
-    runSelected :: Text -> Sh a
-    runSelected selected = case Map.lookup selected (entriesToMap entries) of
-        Just action -> action
-        Nothing     -> showExit ("No such entry: " <> selected)
-
-    entriesToMap :: [Entry a] -> Map.Map Text (Sh a)
-    entriesToMap = Map.fromList . map (\e -> (entryLabel e, entryRun e))
-
-itemEntries :: [ItemTemplate] -> (ItemTemplate -> Sh ()) -> [Entry ()]
-itemEntries xs action =
-    [ Entry (toEntry' (i, x)) (action x)
-    | (i, x) <- [1 :: Int ..] `zip` xs
-    ]
-  where
-    toEntry' :: (Show a) => (ToEntry b) => (a, b) -> Text
-    toEntry' (i, x) = Text.pack (spaces i <> show i <> ". ") <> toEntry x
-
-    spaces i = replicate (width xs - length (show i)) ' '
-
-    width :: [a] -> Int
-    width = length . show . length
-
-data Entry a = Entry
-    { entryLabel :: Text
-    , entryRun   :: Sh a
-    }
-
-newtype Label = Label {unLabel :: Text}
-    deriving stock (Show, Eq)
-
-{-
-Handle errors that can occur when making requests to the vault server.
-It will display a message in dmenu and print the error message to the console
-and then exit the program.
--}
-handleClientError :: ClientError -> Sh a
+handleClientError :: ClientError -> Text
 handleClientError clientError =
     case clientError of
-        (DecodeFailure df _) -> dmenuShow "Decode failure" >> errorExit df
-        (ConnectionError _) -> showExit "Connection error"
-        (UnsupportedContentType _ res) -> showResponseExit "Unsupported content type" res
-        (InvalidContentTypeHeader res) -> showResponseExit "Invalid content type header" res
-        (FailureResponse _ res) -> showExit (reason res)
+        (DecodeFailure _df _)           -> "Decode failure"
+        (ConnectionError _)             -> "Connection error"
+        (UnsupportedContentType _ _res) -> "Unsupported content type"
+        (InvalidContentTypeHeader _res) -> "Invalid content type header"
+        (FailureResponse _ res)         -> reason res
   where
     reason :: Response -> Text
     reason =
@@ -300,76 +106,39 @@ handleClientError clientError =
             . decode @VaultFailureResponse
             . responseBody
 
-showExit :: Text -> Sh a
-showExit t = dmenuShow t >> errorExit t
-
-showResponseExit :: Text -> Response -> Sh a
-showResponseExit err full =
-    dmenuShow err
-        >> errorExit (err <> ":" <> Text.pack (show (responseBody full)))
-
 askPassword :: Sh Password
 askPassword = silently $ Password . head . Text.lines <$> run "dmenu" args
   where
     obscureColor = "#222222"
     args = ["-p", "Enter Password ", "-nb", obscureColor, "-nf", obscureColor]
 
-login :: ClientEnv -> Password -> Sh UnlockData
-login env pw =
-    callApi (unlock pw) env >>= \res ->
-        dmenuShow (unlockDataTitle res)
-            >> pure res
-  where
-    unlock = vaultClient // lockingEp // unlockEp
+login :: Password -> App UnlockData
+login = callApi . (vaultClient // lockingEp // unlockEp)
 
-logout :: ClientEnv -> Sh ()
-logout env = callApi lock env >>= dmenuShow . coerce
-  where
-    lock = vaultClient // lockingEp // lockEp
+logout :: App TitledData
+logout = callApi (vaultClient // lockingEp // lockEp)
 
-sync :: ClientEnv -> Sh ()
-sync env = callApi sync' env >>= dmenuShow . coerce
-  where
-    sync' = vaultClient // miscEp // syncEp
+sync :: App TitledData
+sync = callApi (vaultClient // miscEp // syncEp)
 
-generatePassword :: ClientEnv -> Sh Text
-generatePassword env = do
-    method <- dmenuSelect [] "Method" (Text.unlines ["Generate", "Manual"])
-    case method of
-        "Generate" -> do
-            len <- dmenuSelect [] "Length" "20"
-            special <- dmenuSelect [] "Include special?" (Text.unlines ["Yes", "No"])
-            case readMaybe @Int (Text.unpack len) of
-                Nothing -> showExit "Invalid length"
-                Just len' -> do
-                    let gen spec = callApi (generatePassword' (Just len') False False False spec) env <&> unGenerateData
-                    case head (Text.lines special) of
-                        "Yes" -> gen True
-                        "No"  -> gen False
-                        _     -> showExit "Please choose Yes or No"
-        "Manual" -> dmenuSelect [] "Password" ""
-        _ -> showExit "Please choose Generate or Manual"
-  where
-    generatePassword' :: Maybe Int -> Bool -> Bool -> Bool -> Bool -> ClientM (VaultResponse GenerateData)
-    generatePassword' = vaultClient // miscEp // generatePasswordEp
+getItems :: App [ItemTemplate]
+getItems = coerce <$> callApi (vaultClient // itemsEp // getItemsEp)
 
-getItems :: ClientEnv -> Sh [ItemTemplate]
-getItems = fmap coerce . callApi (vaultClient // itemsEp // getItemsEp)
-
-getStatus :: ClientEnv -> Sh StatusData
+getStatus :: App StatusData
 getStatus = callApi (vaultClient // miscEp // statusEp)
 
-getFolders :: ClientEnv -> Sh [Folder]
-getFolders = fmap coerce . callApi (vaultClient // foldersEp // getFoldersEp)
+getFolders :: App FoldersData
+getFolders = callApi (vaultClient // foldersEp // getFoldersEp)
 
-callApi :: ClientM (VaultResponse a) -> ClientEnv -> Sh a
-callApi action env =
-    liftIO (runClientM action env) >>= \case
-        Left e -> handleClientError e
-        Right (VaultResponse res) -> pure res
+callApiIO :: ClientM (VaultResponse a) -> ClientEnv -> IO (Either Text a)
+callApiIO action env = bimap handleClientError unVaultResponse <$> runClientM action env
 
-dmenuShow :: Text -> Sh ()
-dmenuShow = void . dmenuSelect [] ""
+callApi :: ClientM (VaultResponse a) -> App a
+callApi action = do
+    env <- asks envClient
+    liftIO (callApiIO action env) >>= \case
+        Left e -> interactionLoop (announceInteraction e) >> lift (exit 1)
+        Right r -> pure r
 
 type Todo = PostNoContent
 
@@ -625,295 +394,161 @@ instance FromJSON ItemTemplate where
             4 -> item . ItemIdentity <$> o .: "identity"
             _ -> fail "Invalid item type"
 
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
-------------------------------------
+data Env = Env
+    { envClient :: ClientEnv
+    , envMenu   :: Menu
+    }
+
+newtype Menu = Menu
+    { unMenu ::
+        Prompt ->
+        [Option] ->
+        Sh (Either Text Option)
+    }
+
+type App = ReaderT Env Sh
 
 data Arg = ArgObscured | ArgPrompt Text
 
-newtype Error = Error Text
-
-data Interaction
-    = InteractionQuestion Question
-    | InteractionEnd
-
 newtype Prompt = Prompt {unPrompt :: [Arg]}
 
+newtype Option = Option {unOption :: Text}
+    deriving stock (Show, Eq, Ord)
+
+data Interaction = InteractionQuestion Question | InteractionEnd
+
 data Question = Question
-    { questionPrompt        :: !Prompt
-    , questionContinuations :: !(Map Option Interaction)
-    , questionContext       :: !Context
+    { questionPrompt         :: Prompt
+    , questionOptions        :: [Option]
+    , questionHandleResponse :: Either Text Option -> App Interaction
     }
 
-data Context
-    = ContextLogin
-    | ContextDashboard
-    | ContextAllItems
-    | ContextAnnouncement
-    | ContextViewIndividualItem
+loginInteraction :: Interaction
+loginInteraction =
+    InteractionQuestion $
+        Question
+            (Prompt [ArgPrompt "Enter Password", ArgObscured])
+            []
+            ( \case
+                Right _ -> undefined
+                Left pw -> login (Password pw) >> pure InteractionEnd
+            )
 
-data Option
-    = OptionDashboard Dashboard
-    | OptionIndividualItem IndividualItem
-    | OptionFreeHand Text
-    | OptionAllItems ItemTemplate
-    deriving (Show, Eq, Ord)
-
-data IndividualItem
-    = IndividualItemPasteTitle Text
-    | IndividualItemOpenEditorNotes (Maybe Text)
-    | IndividualItemDoNothingFolder (Maybe Text)
-    deriving (Show, Eq, Ord)
-
-data Dashboard
-    = DashboardViewAll
-    | DashboardSync
-    | DashboardLockVault
-    | DashboardEntry ItemTemplate
-    deriving (Show, Eq, Ord)
-
-toText :: Option -> Text
-toText (OptionFreeHand _) = ""
-toText (OptionDashboard d) = case d of
-    DashboardViewAll   -> "View/Type individual entries"
-    DashboardSync      -> "Sync vault"
-    DashboardLockVault -> "Lock vault"
-    DashboardEntry it  -> toEntry it
-toText (OptionIndividualItem action) = case action of
-    IndividualItemDoNothingFolder t -> "Folder: " <> maybe "None" (head . Text.lines) t
-    IndividualItemOpenEditorNotes t -> "Notes: " <> maybe "None" (head . Text.lines) t
-    IndividualItemPasteTitle t -> "Title: " <> t
-toText (OptionAllItems it) = toEntry it
-
-viewItemI :: ItemTemplate -> Interaction
-viewItemI item =
-    InteractionQuestion
-        ( Question
-            { questionPrompt = Prompt [ArgPrompt "Entry"]
-            , questionContinuations = Map.fromList (itemContinuations item)
-            , questionContext = ContextViewIndividualItem
-            }
-        )
-
-allItemsI :: [ItemTemplate] -> Interaction
-allItemsI items =
-    InteractionQuestion
-        ( Question
-            { questionPrompt = Prompt [ArgPrompt "Entries"]
-            , questionContinuations =
-                Map.fromList $ map (\it -> (OptionAllItems it, viewItemI it)) items
-            , questionContext = ContextAllItems
-            }
-        )
-
-itemContinuations :: ItemTemplate -> [(Option, Interaction)]
-itemContinuations item =
-    first OptionIndividualItem
-        <$> map
-            (,InteractionEnd)
-            [ IndividualItemPasteTitle (itTitle item)
-            , IndividualItemOpenEditorNotes (itNotes item)
-            , IndividualItemDoNothingFolder (itFolderId item)
+dashboardInteraction :: [ItemTemplate] -> Interaction
+dashboardInteraction items =
+    InteractionQuestion $
+        Question
+            (Prompt [ArgPrompt "Entries"])
+            (fst <$> continuations)
+            ( \case
+                Left _ -> pure InteractionEnd
+                Right i -> case Map.lookup i (Map.fromList continuations) of
+                    Nothing -> pure InteractionEnd
+                    Just i' -> i'
+            )
+  where
+    continuations :: [(Option, App Interaction)]
+    continuations =
+        coerce $
+            [
+                ( "View/type individual items"
+                , allItemsInteraction <$> getItems
+                )
+            , ("View previous item", pure InteractionEnd)
+            , ("Edit entries", pure InteractionEnd)
+            , ("Add entry", pure InteractionEnd)
+            , ("Manage folders", pure InteractionEnd)
+            , ("Manage collections", pure InteractionEnd)
+            , ("Sync vault", pure InteractionEnd)
+            , ("Switch vaults", pure InteractionEnd)
+            , ("Lock vault", logout >> pure InteractionEnd)
+            , ("-------- Quick actions --------", pure InteractionEnd)
             ]
+                <> map (\item -> (toEntry item, quickAction item)) items
 
-loginI :: Interaction
-loginI =
-    InteractionQuestion
-        ( Question
-            { questionPrompt = Prompt [ArgPrompt "Enter Password", ArgObscured]
-            , questionContinuations = Map.empty
-            , questionContext = ContextLogin
-            }
-        )
+    quickAction :: ItemTemplate -> App Interaction
+    quickAction i =
+        pure InteractionEnd
+            << case itItem i of
+                ItemIdentity _ -> lift (paste "identity")
+                ItemSecureNote _ -> case itNotes i of
+                    Just n  -> lift (openInEditor_ n)
+                    Nothing -> interactionLoop (announceInteraction "No note")
+                ItemCard (Card{..}) ->
+                    lift (openInEditor_ (Text.unlines [cardHolderName, cardNumber, cardCode]))
+                ItemLogin (Login{..}) -> case (loginUsername, loginPassword) of
+                    (Just u, Just p) -> lift $ do
+                        paste u
+                        pressKey "Tab"
+                        paste p
+                        replicateM_ 2 (pressKey "Return")
+                    _ -> interactionLoop (announceInteraction "No username or password")
 
-dashboardI :: [ItemTemplate] -> Interaction
-dashboardI items =
-    InteractionQuestion
-        ( Question
-            { questionPrompt = Prompt [ArgPrompt "Entries"]
-            , questionContinuations =
-                Map.fromList $
-                    first OptionDashboard
-                        <$> [ (DashboardViewAll, allItemsI items)
-                            , (DashboardSync, InteractionEnd)
-                            , (DashboardLockVault, InteractionEnd)
-                            ]
-                            <> map ((,InteractionEnd) . DashboardEntry) items
-            , questionContext = ContextDashboard
-            }
-        )
+(<<) :: (Monad m) => m a -> m b -> m a
+(<<) = flip (>>)
 
-announceI :: Text -> Interaction
-announceI msg =
-    InteractionQuestion
-        ( Question
-            (Prompt [ArgPrompt msg])
-            Map.empty
-            ContextAnnouncement
-        )
+announceInteraction :: Text -> Interaction
+announceInteraction a =
+    InteractionQuestion $
+        Question
+            (Prompt [ArgPrompt a])
+            []
+            (const $ pure InteractionEnd)
 
-main2 :: IO ()
-main2 = do
+allItemsInteraction :: [ItemTemplate] -> Interaction
+allItemsInteraction items =
+    InteractionQuestion $
+        Question
+            (Prompt [ArgPrompt "Entries"])
+            (fst <$> continuations)
+            ( \case
+                Left _ -> pure InteractionEnd
+                Right o -> case continuations `findContinuation` o of
+                    Nothing -> pure InteractionEnd
+                    Just i  -> i
+            )
+  where
+    continuations :: [(Option, App Interaction)]
+    continuations = map ((,pure InteractionEnd) . Option . toEntry) items
+
+findContinuation :: (Foldable t, Eq a) => t (a, b) -> a -> Maybe b
+findContinuation conts o = snd <$> find ((== o) . fst) conts
+
+main :: IO ()
+main = do
     manager <- newManager defaultManagerSettings
     baseUrl <- parseBaseUrl "http://localhost:8087"
     let env = mkClientEnv manager baseUrl
-    let menu = Menu dmenu
-    shelly $ do
-        status <- getStatus env
 
-        when (statusDataStatus status == Locked) $
-            silently $
-                runInteraction menu env loginI
+    shelly $ runReaderT app (Env env (Menu dmenu))
 
-        items <- getItems env
+app :: App ()
+app = do
+    status <- getStatus
 
-        runInteraction menu env (dashboardI items)
+    when
+        (statusDataStatus status == Locked)
+        (mapReaderT silently (interactionLoop loginInteraction))
 
-runInteraction :: Menu -> ClientEnv -> Interaction -> Sh ()
-runInteraction _ _ InteractionEnd = exit 0
-runInteraction menu env (InteractionQuestion q) = do
-    sel <- coerce menu q
+    items <- getItems
 
-    let continue = runInteraction menu env (questionContinuations q Map.! sel)
+    interactionLoop (dashboardInteraction items)
 
-    case sel of
-        OptionDashboard d -> case d of
-            DashboardSync       -> sync env
-            DashboardLockVault  -> logout env
-            DashboardEntry item -> dashboardAction item
-            _                   -> continue
-        OptionFreeHand t -> case questionContext q of
-            ContextLogin -> void (login env (Password t))
-            ContextAnnouncement -> pure ()
-            _ -> runInteraction menu env (announceI "No such option")
-        _ -> continue
+interactionLoop :: Interaction -> App ()
+interactionLoop InteractionEnd = pure ()
+interactionLoop (InteractionQuestion q) = do
+    response <- askQuestion q
+    interaction <- questionHandleResponse q response
+    interactionLoop interaction
 
-getItems' :: ClientEnv -> IO [ItemTemplate]
-getItems' = coerce . callApi' (vaultClient // itemsEp // getItemsEp)
+askQuestion :: Question -> App (Either Text Option)
+askQuestion q = do
+    Menu menu <- asks envMenu
+    lift (menu (questionPrompt q) (questionOptions q))
 
-callApi' :: ClientM (VaultResponse a) -> ClientEnv -> IO a
-callApi' action env =
-    liftIO (runClientM action env) >>= \case
-        Left e -> print e >> undefined
-        Right (VaultResponse res) -> pure res
-
-newtype Menu = Menu {unMenu :: Question -> Sh Option}
-
-dmenu :: Question -> Sh Option
-dmenu (Question prompt options _context) = do
-    let textOptions = toText <$> Map.keys options
-    let ls = Text.unlines textOptions
-    let optionMap = Map.fromList (zip textOptions (Map.keys options))
+dmenu :: Prompt -> [Option] -> Sh (Either Text Option)
+dmenu prompt options = do
+    let ls = Text.unlines (coerce options)
     let lenLines = Text.pack (show (min 24 (length (Text.lines ls))))
     let obscureColor = "#222222"
 
@@ -927,25 +562,10 @@ dmenu (Question prompt options _context) = do
     setStdin ls
     sel <- run "dmenu" args
     let line = head (Text.lines sel)
-    pure $ case Map.lookup line optionMap of
-        Just o  -> o
-        Nothing -> OptionFreeHand line
-
-dashboardAction :: ItemTemplate -> Sh ()
-dashboardAction i = case itItem i of
-    ItemIdentity _ -> paste "identity"
-    ItemSecureNote _ -> case itNotes i of
-        Just n  -> openInEditor_ n
-        Nothing -> dmenuShow "No note"
-    ItemCard (Card{..}) ->
-        openInEditor_ (Text.unlines [cardHolderName, cardNumber, cardCode])
-    ItemLogin (Login{..}) -> case (loginUsername, loginPassword) of
-        (Just u, Just p) -> do
-            paste u
-            pressKey "Tab"
-            paste p
-            replicateM_ 2 (pressKey "Return")
-        _ -> dmenuShow "No username or password"
+    pure $
+        if line `elem` map coerce options
+            then Right (Option line)
+            else Left line
 
 openInEditor_ :: Text -> Sh ()
 openInEditor_ = void . openInEditor
