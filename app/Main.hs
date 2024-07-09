@@ -41,27 +41,7 @@ import           Shelly                     (Sh, errorExit, exit, fromText,
                                              run_, setStdin, shelly, silently,
                                              toTextIgnore, withTmpDir,
                                              writefile, (<.>))
-
--- generatePassword :: ClientEnv -> Sh Text
--- generatePassword env = do
---     method <- dmenuSelect [] "Method" (Text.unlines ["Generate", "Manual"])
---     case method of
---         "Generate" -> do
---             len <- dmenuSelect [] "Length" "20"
---             special <- dmenuSelect [] "Include special?" (Text.unlines ["Yes", "No"])
---             case readMaybe @Int (Text.unpack len) of
---                 Nothing -> showExit "Invalid length"
---                 Just len' -> do
---                     let gen spec = callApi (generatePassword' (Just len') False False False spec) env <&> unGenerateData
---                     case head (Text.lines special) of
---                         "Yes" -> gen True
---                         "No"  -> gen False
---                         _     -> showExit "Please choose Yes or No"
---         "Manual" -> dmenuSelect [] "Password" ""
---         _ -> showExit "Please choose Generate or Manual"
---   where
---     generatePassword' :: Maybe Int -> Bool -> Bool -> Bool -> Bool -> ClientM (VaultResponse GenerateData)
---     generatePassword' = vaultClient // miscEp // generatePasswordEp
+import           Text.Read                  (readMaybe)
 
 default (Text)
 
@@ -137,7 +117,7 @@ callApi :: ClientM (VaultResponse a) -> App a
 callApi action = do
     env <- asks envClient
     liftIO (callApiIO action env) >>= \case
-        Left e -> interactionLoop (announceInteraction e) >> lift (exit 1)
+        Left e -> interactionLoop (announceI e) >> lift (exit 1)
         Right r -> pure r
 
 type Todo = PostNoContent
@@ -423,8 +403,8 @@ data Question = Question
     , questionHandleResponse :: Either Text Option -> App Interaction
     }
 
-typeItemInteraction :: ItemTemplate -> Interaction
-typeItemInteraction item =
+typeItemI :: ItemTemplate -> Interaction
+typeItemI item =
     InteractionQuestion $
         Question
             (Prompt [ArgPrompt "Entries"])
@@ -459,7 +439,9 @@ specificTypeItemOptions item =
             ]
                 <> case fmap (zip [1 :: Int ..]) loginUris of
                     Just uris ->
-                        [ ("URL" <> Text.pack (show i) <> ": " <> coerce url, lift (openInBrowser_ (coerce url)))
+                        [ ( "URL" <> Text.pack (show i) <> ": " <> coerce url
+                          , lift (openInBrowser_ (coerce url))
+                          )
                         | (i, url) <- uris
                         ]
                     Nothing -> []
@@ -471,8 +453,8 @@ specificTypeItemOptions item =
         ItemIdentity _ -> []
         ItemSecureNote _ -> []
 
-editItemInteraction :: ItemTemplate -> Interaction
-editItemInteraction item =
+editItemI :: ItemTemplate -> Interaction
+editItemI item =
     InteractionQuestion $
         Question
             (Prompt [ArgPrompt "Entries"])
@@ -490,12 +472,12 @@ editItemOptions old@(ItemTemplate{..}) =
         <$> [
                 ( "Title: " <> itTitle
                 , pure $
-                    editInteraction
+                    editI
                         "Title"
                         [itTitle]
                         ( \case
-                            Right _ -> pure (editItemInteraction old)
-                            Left new -> pure (editItemInteraction (old{itTitle = new}))
+                            Right _ -> pure (editItemI old)
+                            Left new -> pure (editItemI (old{itTitle = new}))
                         )
                 )
             ,
@@ -503,26 +485,26 @@ editItemOptions old@(ItemTemplate{..}) =
                 , do
                     folders <- getFolders
                     pure $
-                        editInteraction
+                        editI
                             "Folder"
                             (coerce folders)
                             ( \case
-                                Right (Option new) -> pure (editItemInteraction (old{itFolderId = Just new}))
-                                Left _ -> pure (editItemInteraction old)
+                                Right (Option new) -> pure (editItemI (old{itFolderId = Just new}))
+                                Left _ -> pure (editItemI old)
                             )
                 )
             ,
                 ( "Notes: " <> maybe "None" (const "<Enter to edit>") itNotes
                 , do
                     newNotes <- lift (openInEditor (fromMaybe "" itNotes))
-                    pure $ editItemInteraction (old{itNotes = Just newNotes})
+                    pure $ editItemI (old{itNotes = Just newNotes})
                 )
             ]
     )
         <> specificEditItemOptions old
 
-editInteraction :: Text -> [Text] -> (Either Text Option -> App Interaction) -> Interaction
-editInteraction prompt olds next =
+editI :: Text -> [Text] -> (Either Text Option -> App Interaction) -> Interaction
+editI prompt olds next =
     InteractionQuestion $
         Question (Prompt [ArgPrompt prompt]) (coerce olds) next
 
@@ -533,24 +515,29 @@ specificEditItemOptions old =
             [
                 ( "Username: " <> fromMaybe "None" loginUsername
                 , pure $
-                    editInteraction
+                    editI
                         "Username"
                         [fromMaybe "" loginUsername]
                         ( \case
-                            Right _ -> pure (editItemInteraction old)
-                            Left new -> pure (editItemInteraction (old{itItem = ItemLogin l{loginUsername = Just new}}))
+                            Right _ -> pure (editItemI old)
+                            Left new ->
+                                pure
+                                    ( editItemI
+                                        (old{itItem = ItemLogin l{loginUsername = Just new}})
+                                    )
                         )
                 )
             ,
-                ( "Password: ********"
-                , pure $
-                    editInteraction
-                        "Password"
-                        [fromMaybe "" loginUsername]
-                        ( \case
-                            Right _ -> pure (editItemInteraction old)
-                            Left new -> pure (editItemInteraction (old{itItem = ItemLogin l{loginPassword = Just new}}))
-                        )
+                ( "Password: " <> fromMaybe "None" loginPassword
+                , do
+                    mpw <- generatePassword
+                    case mpw of
+                        Just pw ->
+                            pure
+                                ( editItemI
+                                    (old{itItem = ItemLogin l{loginPassword = Just pw}})
+                                )
+                        Nothing -> pure (editItemI old)
                 )
             ]
         --                <> case fmap (zip [1 :: Int ..]) loginUris of
@@ -563,42 +550,52 @@ specificEditItemOptions old =
             [
                 ( "Cardholder Name: " <> cardHolderName
                 , pure $
-                    editInteraction
+                    editI
                         "Cardholder Name"
                         [cardHolderName]
                         ( \case
-                            Right _ -> pure (editItemInteraction old)
-                            Left new -> pure (editItemInteraction (old{itItem = ItemCard c{cardHolderName = new}}))
+                            Right _ -> pure (editItemI old)
+                            Left new ->
+                                pure
+                                    ( editItemI
+                                        (old{itItem = ItemCard c{cardHolderName = new}})
+                                    )
                         )
                 )
             ,
                 ( "Number: " <> cardNumber
                 , pure $
-                    editInteraction
+                    editI
                         "Number"
                         [cardNumber]
                         ( \case
-                            Right _ -> pure (editItemInteraction old)
-                            Left new -> pure (editItemInteraction (old{itItem = ItemCard c{cardNumber = new}}))
+                            Right _ ->
+                                pure
+                                    (editItemI old)
+                            Left new ->
+                                pure
+                                    ( editItemI
+                                        (old{itItem = ItemCard c{cardNumber = new}})
+                                    )
                         )
                 )
             ,
                 ( "Security Code: " <> cardCode
                 , pure $
-                    editInteraction
+                    editI
                         "Security Code"
                         [cardCode]
                         ( \case
-                            Right _ -> pure (editItemInteraction old)
-                            Left new -> pure (editItemInteraction (old{itItem = ItemCard c{cardCode = new}}))
+                            Right _ -> pure (editItemI old)
+                            Left new -> pure (editItemI (old{itItem = ItemCard c{cardCode = new}}))
                         )
                 )
             ]
         ItemIdentity _ -> []
         ItemSecureNote _ -> []
 
-loginInteraction :: Interaction
-loginInteraction =
+loginI :: Interaction
+loginI =
     InteractionQuestion $
         Question
             (Prompt [ArgPrompt "Enter Password", ArgObscured])
@@ -608,8 +605,8 @@ loginInteraction =
                 Left pw -> login (Password pw) >> pure InteractionEnd
             )
 
-dashboardInteraction :: [ItemTemplate] -> Interaction
-dashboardInteraction items =
+dashboardI :: [ItemTemplate] -> Interaction
+dashboardI items =
     InteractionQuestion $
         Question
             (Prompt [ArgPrompt "Entries"])
@@ -626,7 +623,7 @@ dashboardInteraction items =
         coerce $
             [
                 ( "View/type individual items"
-                , allItemsInteraction typeItemInteraction <$> getItems
+                , allItemsI typeItemI <$> getItems
                 )
             ,
                 ( "View previous entry"
@@ -634,10 +631,10 @@ dashboardInteraction items =
                     itemId <- lift readCache
                     let cachedItem = find ((== itemId) . itId) items
                     pure $ case cachedItem of
-                        Just item -> typeItemInteraction item
-                        Nothing   -> announceInteraction "No previous entry"
+                        Just item -> typeItemI item
+                        Nothing   -> announceI "No previous entry"
                 )
-            , ("Edit entries", allItemsInteraction editItemInteraction <$> getItems)
+            , ("Edit entries", allItemsI editItemI <$> getItems)
             , ("Add entry", pure InteractionEnd)
             , ("Manage folders", pure InteractionEnd)
             , ("Manage collections", pure InteractionEnd)
@@ -654,7 +651,7 @@ dashboardInteraction items =
             ItemIdentity _ -> lift (paste "identity")
             ItemSecureNote _ -> case itNotes i of
                 Just n  -> lift (openInEditor_ n)
-                Nothing -> interactionLoop (announceInteraction "No note")
+                Nothing -> interactionLoop (announceI "No note")
             ItemCard (Card{..}) ->
                 lift (openInEditor_ (Text.unlines [cardHolderName, cardNumber, cardCode]))
             ItemLogin (Login{..}) -> case (loginUsername, loginPassword) of
@@ -667,18 +664,18 @@ dashboardInteraction items =
             >> pure InteractionEnd
 
 announce :: Text -> App ()
-announce = interactionLoop . announceInteraction
+announce = interactionLoop . announceI
 
-announceInteraction :: Text -> Interaction
-announceInteraction a =
+announceI :: Text -> Interaction
+announceI a =
     InteractionQuestion $
         Question
             (Prompt [ArgPrompt a])
             []
             (const $ pure InteractionEnd)
 
-allItemsInteraction :: (ItemTemplate -> Interaction) -> [ItemTemplate] -> Interaction
-allItemsInteraction interaction items =
+allItemsI :: (ItemTemplate -> Interaction) -> [ItemTemplate] -> Interaction
+allItemsI interaction items =
     InteractionQuestion $
         Question
             (Prompt [ArgPrompt "Entries"])
@@ -707,11 +704,11 @@ app = do
 
     when
         (statusDataStatus status == Locked)
-        (mapReaderT silently (interactionLoop loginInteraction))
+        (mapReaderT silently (interactionLoop loginI))
 
     items <- getItems
 
-    interactionLoop (dashboardInteraction items)
+    interactionLoop (dashboardI items)
 
 interactionLoop :: Interaction -> App ()
 interactionLoop InteractionEnd = pure ()
@@ -765,5 +762,21 @@ openInEditor text = do
             run_ "st" [e, toTextIgnore (fp <.> "hwarden")]
             readfile (fp <.> "hwarden")
 
--- TODO
--- itemlogin totp
+generatePassword :: App (Maybe Text)
+generatePassword = do
+    Menu menu <- asks envMenu
+    Right (Option m) <- lift $ menu (Prompt [ArgPrompt "Method"]) [Option "Generate", Option "Manual"]
+    case m of
+        "Manual" -> lift $ menu (Prompt [ArgPrompt "Password"]) [] >>= \(Left newPw) -> pure (Just newPw)
+        "Generate" -> do
+            len <- lift $ either id coerce <$> menu (Prompt [ArgPrompt "Length"]) [Option "20"]
+            Right (Option s) <- lift $ menu (Prompt [ArgPrompt "Include special?"]) [Option "Yes", Option "No"]
+            case readMaybe @Int (Text.unpack len) of
+                Nothing -> pure Nothing
+                Just len' -> do
+                    let gen spec = Just . unGenerateData <$> callApi ((vaultClient // miscEp // generatePasswordEp) (Just len') False False False spec)
+                    case s of
+                        "Yes" -> gen True
+                        "No"  -> gen False
+                        _     -> pure Nothing
+        _ -> undefined
