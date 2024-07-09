@@ -15,10 +15,10 @@ import           Data.Aeson                 (FromJSON (parseJSON),
                                              ToJSON (toJSON), decode, object,
                                              withObject, withText, (.:), (.:?),
                                              (.=))
-import           Data.Bifunctor             (bimap, first)
+import           Data.Bifunctor             (Bifunctor (first), bimap)
 import           Data.Coerce                (coerce)
+import           Data.Foldable              (for_)
 import           Data.List                  (find, foldl', intersperse)
-import qualified Data.Map                   as Map
 import           Data.Maybe                 (catMaybes, fromMaybe)
 import           Data.Ord                   (comparing)
 import           Data.Text                  (Text)
@@ -127,8 +127,8 @@ getItems = coerce <$> callApi (vaultClient // itemsEp // getItemsEp)
 getStatus :: App StatusData
 getStatus = callApi (vaultClient // miscEp // statusEp)
 
-getFolders :: App FoldersData
-getFolders = callApi (vaultClient // foldersEp // getFoldersEp)
+getFolders :: App [Folder]
+getFolders = coerce <$> callApi (vaultClient // foldersEp // getFoldersEp)
 
 callApiIO :: ClientM (VaultResponse a) -> ClientEnv -> IO (Either Text a)
 callApiIO action env = bimap handleClientError unVaultResponse <$> runClientM action env
@@ -423,6 +423,180 @@ data Question = Question
     , questionHandleResponse :: Either Text Option -> App Interaction
     }
 
+typeItemInteraction :: ItemTemplate -> Interaction
+typeItemInteraction item =
+    InteractionQuestion $
+        Question
+            (Prompt [ArgPrompt "Entries"])
+            (fst <$> typeItemOptions item)
+            ( \case
+                Left _ -> pure InteractionEnd
+                Right i -> case i `lookup` typeItemOptions item of
+                    Nothing -> pure InteractionEnd
+                    Just i' -> i'
+            )
+
+typeItemOptions :: ItemTemplate -> [(Option, App Interaction)]
+typeItemOptions (ItemTemplate{..}) =
+    ( bimap Option (>> pure InteractionEnd)
+        <$> [ ("Title: " <> itTitle, lift (paste itTitle))
+            , ("Folder: " <> fromMaybe "None" itFolderId, lift (for_ itFolderId paste))
+            ,
+                ( "Notes: " <> maybe "None" (const "<Enter to view>") itNotes
+                , lift (for_ itNotes openInEditor_)
+                )
+            ]
+    )
+        <> specificTypeItemOptions itItem
+
+specificTypeItemOptions :: Item -> [(Option, App Interaction)]
+specificTypeItemOptions item =
+    bimap Option (>> pure InteractionEnd) <$> case item of
+        ItemLogin Login{..} ->
+            [ ("Username: " <> fromMaybe "None" loginUsername, lift (for_ loginUsername paste))
+            , ("Password: ********", lift (for_ loginPassword paste))
+            , ("TOTP: " <> fromMaybe "None" loginTotp, pure ())
+            ]
+                <> case fmap (zip [1 :: Int ..]) loginUris of
+                    Just uris ->
+                        [ ("URL" <> Text.pack (show i) <> ": " <> coerce url, lift (openInBrowser_ (coerce url)))
+                        | (i, url) <- uris
+                        ]
+                    Nothing -> []
+        ItemCard Card{..} ->
+            [ ("Cardholder Name: " <> cardHolderName, lift (paste cardHolderName))
+            , ("Number: " <> cardNumber, lift (paste cardNumber))
+            , ("Security Code: " <> cardCode, lift (paste cardCode))
+            ]
+        ItemIdentity _ -> []
+        ItemSecureNote _ -> []
+
+editItemInteraction :: ItemTemplate -> Interaction
+editItemInteraction item =
+    InteractionQuestion $
+        Question
+            (Prompt [ArgPrompt "Entries"])
+            (fst <$> editItemOptions item)
+            ( \case
+                Left _ -> pure InteractionEnd
+                Right i -> case i `lookup` editItemOptions item of
+                    Nothing -> pure InteractionEnd
+                    Just i' -> i'
+            )
+
+editItemOptions :: ItemTemplate -> [(Option, App Interaction)]
+editItemOptions old@(ItemTemplate{..}) =
+    ( first Option
+        <$> [
+                ( "Title: " <> itTitle
+                , pure $
+                    editInteraction
+                        "Title"
+                        [itTitle]
+                        ( \case
+                            Right _ -> pure (editItemInteraction old)
+                            Left new -> pure (editItemInteraction (old{itTitle = new}))
+                        )
+                )
+            ,
+                ( "Folder: " <> fromMaybe "None" itFolderId
+                , do
+                    folders <- getFolders
+                    pure $
+                        editInteraction
+                            "Folder"
+                            (coerce folders)
+                            ( \case
+                                Right (Option new) -> pure (editItemInteraction (old{itFolderId = Just new}))
+                                Left _ -> pure (editItemInteraction old)
+                            )
+                )
+            ,
+                ( "Notes: " <> maybe "None" (const "<Enter to edit>") itNotes
+                , do
+                    newNotes <- lift (openInEditor (fromMaybe "" itNotes))
+                    pure $ editItemInteraction (old{itNotes = Just newNotes})
+                )
+            ]
+    )
+        <> specificEditItemOptions old
+
+editInteraction :: Text -> [Text] -> (Either Text Option -> App Interaction) -> Interaction
+editInteraction prompt olds next =
+    InteractionQuestion $
+        Question (Prompt [ArgPrompt prompt]) (coerce olds) next
+
+specificEditItemOptions :: ItemTemplate -> [(Option, App Interaction)]
+specificEditItemOptions old =
+    first Option <$> case itItem old of
+        (ItemLogin l@Login{..}) ->
+            [
+                ( "Username: " <> fromMaybe "None" loginUsername
+                , pure $
+                    editInteraction
+                        "Username"
+                        [fromMaybe "" loginUsername]
+                        ( \case
+                            Right _ -> pure (editItemInteraction old)
+                            Left new -> pure (editItemInteraction (old{itItem = ItemLogin l{loginUsername = Just new}}))
+                        )
+                )
+            ,
+                ( "Password: ********"
+                , pure $
+                    editInteraction
+                        "Password"
+                        [fromMaybe "" loginUsername]
+                        ( \case
+                            Right _ -> pure (editItemInteraction old)
+                            Left new -> pure (editItemInteraction (old{itItem = ItemLogin l{loginPassword = Just new}}))
+                        )
+                )
+            ]
+        --                <> case fmap (zip [1 :: Int ..]) loginUris of
+        --                    Just uris ->
+        --                        [ ("URL" <> Text.pack (show i) <> ": " <> coerce url, lift (openInBrowser_ (coerce url)))
+        --                        | (i, url) <- uris
+        --                        ]
+        --                    Nothing -> []
+        ItemCard c@Card{..} ->
+            [
+                ( "Cardholder Name: " <> cardHolderName
+                , pure $
+                    editInteraction
+                        "Cardholder Name"
+                        [cardHolderName]
+                        ( \case
+                            Right _ -> pure (editItemInteraction old)
+                            Left new -> pure (editItemInteraction (old{itItem = ItemCard c{cardHolderName = new}}))
+                        )
+                )
+            ,
+                ( "Number: " <> cardNumber
+                , pure $
+                    editInteraction
+                        "Number"
+                        [cardNumber]
+                        ( \case
+                            Right _ -> pure (editItemInteraction old)
+                            Left new -> pure (editItemInteraction (old{itItem = ItemCard c{cardNumber = new}}))
+                        )
+                )
+            ,
+                ( "Security Code: " <> cardCode
+                , pure $
+                    editInteraction
+                        "Security Code"
+                        [cardCode]
+                        ( \case
+                            Right _ -> pure (editItemInteraction old)
+                            Left new -> pure (editItemInteraction (old{itItem = ItemCard c{cardCode = new}}))
+                        )
+                )
+            ]
+        ItemIdentity _ -> []
+        ItemSecureNote _ -> []
+
 loginInteraction :: Interaction
 loginInteraction =
     InteractionQuestion $
@@ -430,7 +604,7 @@ loginInteraction =
             (Prompt [ArgPrompt "Enter Password", ArgObscured])
             []
             ( \case
-                Right _ -> undefined
+                Right _ -> pure InteractionEnd
                 Left pw -> login (Password pw) >> pure InteractionEnd
             )
 
@@ -442,7 +616,7 @@ dashboardInteraction items =
             (fst <$> continuations)
             ( \case
                 Left _ -> pure InteractionEnd
-                Right i -> case Map.lookup i (Map.fromList continuations) of
+                Right i -> case i `lookup` continuations of
                     Nothing -> pure InteractionEnd
                     Just i' -> i'
             )
@@ -452,10 +626,18 @@ dashboardInteraction items =
         coerce $
             [
                 ( "View/type individual items"
-                , allItemsInteraction <$> getItems
+                , allItemsInteraction typeItemInteraction <$> getItems
                 )
-            , ("View previous item", pure InteractionEnd)
-            , ("Edit entries", pure InteractionEnd)
+            ,
+                ( "View previous entry"
+                , do
+                    itemId <- lift readCache
+                    let cachedItem = find ((== itemId) . itId) items
+                    pure $ case cachedItem of
+                        Just item -> typeItemInteraction item
+                        Nothing   -> announceInteraction "No previous entry"
+                )
+            , ("Edit entries", allItemsInteraction editItemInteraction <$> getItems)
             , ("Add entry", pure InteractionEnd)
             , ("Manage folders", pure InteractionEnd)
             , ("Manage collections", pure InteractionEnd)
@@ -468,24 +650,24 @@ dashboardInteraction items =
 
     quickAction :: ItemTemplate -> App Interaction
     quickAction i =
-        pure InteractionEnd
-            << case itItem i of
-                ItemIdentity _ -> lift (paste "identity")
-                ItemSecureNote _ -> case itNotes i of
-                    Just n  -> lift (openInEditor_ n)
-                    Nothing -> interactionLoop (announceInteraction "No note")
-                ItemCard (Card{..}) ->
-                    lift (openInEditor_ (Text.unlines [cardHolderName, cardNumber, cardCode]))
-                ItemLogin (Login{..}) -> case (loginUsername, loginPassword) of
-                    (Just u, Just p) -> lift $ do
-                        paste u
-                        pressKey "Tab"
-                        paste p
-                        replicateM_ 2 (pressKey "Return")
-                    _ -> interactionLoop (announceInteraction "No username or password")
+        case itItem i of
+            ItemIdentity _ -> lift (paste "identity")
+            ItemSecureNote _ -> case itNotes i of
+                Just n  -> lift (openInEditor_ n)
+                Nothing -> interactionLoop (announceInteraction "No note")
+            ItemCard (Card{..}) ->
+                lift (openInEditor_ (Text.unlines [cardHolderName, cardNumber, cardCode]))
+            ItemLogin (Login{..}) -> case (loginUsername, loginPassword) of
+                (Just u, Just p) -> lift $ do
+                    paste u
+                    pressKey "Tab"
+                    paste p
+                    replicateM_ 2 (pressKey "Return")
+                _ -> announce "No username or password"
+            >> pure InteractionEnd
 
-(<<) :: (Monad m) => m a -> m b -> m a
-(<<) = flip (>>)
+announce :: Text -> App ()
+announce = interactionLoop . announceInteraction
 
 announceInteraction :: Text -> Interaction
 announceInteraction a =
@@ -495,24 +677,21 @@ announceInteraction a =
             []
             (const $ pure InteractionEnd)
 
-allItemsInteraction :: [ItemTemplate] -> Interaction
-allItemsInteraction items =
+allItemsInteraction :: (ItemTemplate -> Interaction) -> [ItemTemplate] -> Interaction
+allItemsInteraction interaction items =
     InteractionQuestion $
         Question
             (Prompt [ArgPrompt "Entries"])
             (fst <$> continuations)
             ( \case
                 Left _ -> pure InteractionEnd
-                Right o -> case continuations `findContinuation` o of
+                Right o -> case o `lookup` continuations of
                     Nothing -> pure InteractionEnd
                     Just i  -> i
             )
   where
     continuations :: [(Option, App Interaction)]
-    continuations = map ((,pure InteractionEnd) . Option . toEntry) items
-
-findContinuation :: (Foldable t, Eq a) => t (a, b) -> a -> Maybe b
-findContinuation conts o = snd <$> find ((== o) . fst) conts
+    continuations = (\t -> (Option (toEntry t), lift (writeCache (itId t)) >> pure (interaction t))) <$> items
 
 main :: IO ()
 main = do
@@ -570,6 +749,12 @@ dmenu prompt options = do
 openInEditor_ :: Text -> Sh ()
 openInEditor_ = void . openInEditor
 
+openInBrowser_ :: Text -> Sh ()
+openInBrowser_ = void . openInBrowser
+
+openInBrowser :: Text -> Sh Text
+openInBrowser = run "firefox" . pure
+
 openInEditor :: Text -> Sh Text
 openInEditor text = do
     editor <- get_env "EDITOR"
@@ -579,3 +764,6 @@ openInEditor text = do
             writefile (fp <.> "hwarden") text
             run_ "st" [e, toTextIgnore (fp <.> "hwarden")]
             readfile (fp <.> "hwarden")
+
+-- TODO
+-- itemlogin totp
