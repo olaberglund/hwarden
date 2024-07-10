@@ -27,10 +27,10 @@ import           Data.Time                  (UTCTime)
 import           GHC.Generics               (Generic)
 import           Network.HTTP.Client        (defaultManagerSettings, newManager)
 import           Prelude                    hiding (log)
-import           Servant                    (Get, JSON, NamedRoutes, Post,
-                                             PostNoContent, Proxy (Proxy),
-                                             QueryFlag, QueryParam, ReqBody,
-                                             (:-), (:>))
+import           Servant                    (Capture, Get, JSON, NamedRoutes,
+                                             Post, PostNoContent, Proxy (Proxy),
+                                             Put, QueryFlag, QueryParam,
+                                             ReqBody, (:-), (:>))
 import           Servant.Client             (AsClientT, ClientEnv,
                                              ClientError (..), ClientM,
                                              Response, client, mkClientEnv,
@@ -39,8 +39,8 @@ import           Servant.Client             (AsClientT, ClientEnv,
 import           Shelly                     (Sh, errorExit, exit, fromText,
                                              get_env, liftIO, readfile, run,
                                              run_, setStdin, shelly, silently,
-                                             toTextIgnore, withTmpDir,
-                                             writefile, (<.>))
+                                             toTextIgnore, verbosely,
+                                             withTmpDir, writefile, (<.>))
 import           Text.Read                  (readMaybe)
 
 default (Text)
@@ -186,7 +186,15 @@ instance ToJSON Password where
 
 data VaultItemsApi as = VaultItemsApi
     { addItemEp :: as :- Todo
-    , editItemEp :: as :- Todo
+    , editItemEp ::
+        as
+            :- "object"
+                :> "item"
+                :> Capture "id" Text
+                :> ReqBody '[JSON] ItemTemplate
+                :> Put
+                    '[JSON]
+                    (VaultResponse ItemTemplate)
     , getItemEp :: as :- Todo
     , getItemsEp :: as :- "list" :> "object" :> "items" :> Get '[JSON] (VaultResponse ItemsData)
     , deleteItemEp :: as :- Todo
@@ -276,7 +284,7 @@ toSymbol = \case
     ItemSecureNote _ -> "(n)"
 
 instance ToEntry ItemTemplate where
-    toEntry (ItemTemplate _ _ name _ item) =
+    toEntry (ItemTemplate _ _ name _ _ item) =
         mappend (toSymbol item <> " " <> name) $
             (\t -> if Text.null t then "" else " - " <> t) $
                 merge $
@@ -309,6 +317,7 @@ data ItemTemplate = ItemTemplate
     , itFolderId :: Maybe Text
     , itTitle    :: Text
     , itNotes    :: Maybe Text
+    , itFavorite :: Bool
     , itItem     :: Item
     }
     deriving (Show, Eq)
@@ -324,6 +333,9 @@ newtype Uri = Uri
 instance FromJSON Uri where
     parseJSON = withObject "Uri" $ \o -> Uri <$> o .: "uri"
 
+instance ToJSON Uri where
+    toJSON (Uri uri) = object ["uri" .= uri]
+
 data Login = Login
     { loginUris     :: Maybe [Uri]
     , loginUsername :: Maybe Text
@@ -336,22 +348,46 @@ instance FromJSON Login where
     parseJSON = withObject "Login" $ \o ->
         Login <$> o .:? "uris" <*> o .:? "username" <*> o .: "password" <*> o .:? "totp"
 
+instance ToJSON Login where
+    toJSON Login{..} =
+        object
+            [ "uris" .= loginUris
+            , "username" .= loginUsername
+            , "password" .= loginPassword
+            , "totp" .= loginTotp
+            ]
+
 data SecureNote = SecureNote
     deriving stock (Show, Eq, Ord)
 
 instance FromJSON SecureNote where
     parseJSON = withObject "SecureNote" $ const (pure SecureNote)
 
+instance ToJSON SecureNote where
+    toJSON SecureNote = object []
+
 data Card = Card
     { cardHolderName :: Text
     , cardNumber     :: Text
     , cardCode       :: Text
+    , cardExpMonth   :: Text
+    , cardExpYear    :: Text
     }
     deriving stock (Show, Eq, Ord)
 
 instance FromJSON Card where
     parseJSON = withObject "Card" $ \o ->
-        Card <$> o .: "cardholderName" <*> o .: "number" <*> o .: "code"
+        Card <$> o .: "cardholderName" <*> o .: "number" <*> o .: "code" <*> o .: "expMonth" <*> o .: "expYear"
+
+instance ToJSON Card where
+    toJSON Card{..} =
+        object
+            [ "cardholderName" .= cardHolderName
+            , "number" .= cardNumber
+            , "code" .= cardCode
+            , "expMonth" .= cardExpMonth
+            , "expYear" .= cardExpYear
+            ]
 
 data Identity = Identity
     deriving stock (Show, Eq, Ord)
@@ -366,13 +402,28 @@ instance FromJSON ItemTemplate where
         itFolderId <- o .: "folderId"
         itName <- o .: "name"
         itNotes <- o .: "notes"
-        let item = ItemTemplate itId itFolderId itName itNotes
+        itFavorite <- o .: "favorite"
+        let item = ItemTemplate itId itFolderId itName itNotes itFavorite
         case itType of
             1 -> item . ItemLogin <$> o .: "login"
             2 -> item . ItemSecureNote <$> o .: "secureNote"
             3 -> item . ItemCard <$> o .: "card"
             4 -> item . ItemIdentity <$> o .: "identity"
             _ -> fail "Invalid item type"
+
+instance ToJSON ItemTemplate where
+    toJSON ItemTemplate{..} =
+        object
+            [ "folderId" .= itFolderId
+            , "name" .= itTitle
+            , "notes" .= itNotes
+            , "favorite" .= itFavorite
+            , case itItem of
+                ItemLogin l      -> "login" .= l
+                ItemSecureNote _ -> "secureNote" .= ()
+                ItemCard c       -> "card" .= c
+                ItemIdentity _   -> "identity" .= ()
+            ]
 
 data Env = Env
     { envClient :: ClientEnv
@@ -453,146 +504,164 @@ specificTypeItemOptions item =
         ItemIdentity _ -> []
         ItemSecureNote _ -> []
 
-editItemI :: ItemTemplate -> Interaction
-editItemI item =
+data EditType = Update | Create
+
+editItemI :: EditType -> ItemTemplate -> Interaction
+editItemI et item@(ItemTemplate{..}) =
     InteractionQuestion $
         Question
             (Prompt [ArgPrompt "Entries"])
-            (fst <$> editItemOptions item)
+            (fst <$> editItemOptions)
             ( \case
                 Left _ -> pure InteractionEnd
-                Right i -> case i `lookup` editItemOptions item of
+                Right i -> case i `lookup` editItemOptions of
                     Nothing -> pure InteractionEnd
                     Just i' -> i'
             )
+  where
+    miscOptions :: [(Option, App Interaction)]
+    miscOptions =
+        [ (Option "Delete entry", pure InteractionEnd)
+        ,
+            ( Option "Save entry"
+            , case et of
+                Update -> callApi ((vaultClient // itemsEp // editItemEp) itId item) >> pure InteractionEnd
+                Create -> callApi ((vaultClient // itemsEp // editItemEp) itId item) >> pure InteractionEnd
+            )
+        ]
 
-editItemOptions :: ItemTemplate -> [(Option, App Interaction)]
-editItemOptions old@(ItemTemplate{..}) =
-    ( first Option
-        <$> [
-                ( "Title: " <> itTitle
-                , pure $
-                    editI
-                        "Title"
-                        [itTitle]
-                        ( \case
-                            Right _ -> pure (editItemI old)
-                            Left new -> pure (editItemI (old{itTitle = new}))
-                        )
-                )
-            ,
-                ( "Folder: " <> fromMaybe "None" itFolderId
-                , do
-                    folders <- getFolders
-                    pure $
+    editItemOptions :: [(Option, App Interaction)]
+    editItemOptions =
+        ( first Option
+            <$> [
+                    ( "Title: " <> itTitle
+                    , pure $
                         editI
-                            "Folder"
-                            (coerce folders)
+                            "Title"
+                            [itTitle]
                             ( \case
-                                Right (Option new) -> pure (editItemI (old{itFolderId = Just new}))
-                                Left _ -> pure (editItemI old)
+                                Right _ -> pure (editItemI et item)
+                                Left new -> pure (editItemI et (item{itTitle = new}))
                             )
-                )
-            ,
-                ( "Notes: " <> maybe "None" (const "<Enter to edit>") itNotes
-                , do
-                    newNotes <- lift (openInEditor (fromMaybe "" itNotes))
-                    pure $ editItemI (old{itNotes = Just newNotes})
-                )
-            ]
-    )
-        <> specificEditItemOptions old
+                    )
+                ,
+                    ( "Folder: " <> fromMaybe "None" itFolderId
+                    , do
+                        folders <- getFolders
+                        pure $
+                            editI
+                                "Folder"
+                                (coerce folders)
+                                ( \case
+                                    Right (Option new) -> pure (editItemI et (item{itFolderId = Just new}))
+                                    Left _ -> pure (editItemI et item)
+                                )
+                    )
+                ,
+                    ( "Notes: " <> maybe "None" (const "<Enter to edit>") itNotes
+                    , do
+                        newNotes <- lift (openInEditor (fromMaybe "" itNotes))
+                        pure $ editItemI et (item{itNotes = Just newNotes})
+                    )
+                ]
+        )
+            <> specificEditItemOptions
+            <> miscOptions
+
+    specificEditItemOptions :: [(Option, App Interaction)]
+    specificEditItemOptions =
+        first Option <$> case itItem of
+            (ItemLogin l@Login{..}) ->
+                [
+                    ( "Username: " <> fromMaybe "None" loginUsername
+                    , pure $
+                        editI
+                            "Username"
+                            [fromMaybe "" loginUsername]
+                            ( \case
+                                Right _ -> pure (editItemI et item)
+                                Left new ->
+                                    pure
+                                        ( editItemI
+                                            et
+                                            (item{itItem = ItemLogin l{loginUsername = Just new}})
+                                        )
+                            )
+                    )
+                ,
+                    ( "Password: ********"
+                    , do
+                        mpw <- generatePassword
+                        case mpw of
+                            Just pw ->
+                                pure
+                                    ( editItemI
+                                        et
+                                        (item{itItem = ItemLogin l{loginPassword = Just pw}})
+                                    )
+                            Nothing -> pure (editItemI et item)
+                    )
+                ]
+            --                <> case fmap (zip [1 :: Int ..]) loginUris of
+            --                    Just uris ->
+            --                        [ ("URL" <> Text.pack (show i) <> ": " <> coerce url, lift (openInBrowser_ (coerce url)))
+            --                        | (i, url) <- uris
+            --                        ]
+            --                    Nothing -> []
+            ItemCard c@Card{..} ->
+                [
+                    ( "Cardholder Name: " <> cardHolderName
+                    , pure $
+                        editI
+                            "Cardholder Name"
+                            [cardHolderName]
+                            ( \case
+                                Right _ -> pure (editItemI et item)
+                                Left new ->
+                                    pure
+                                        ( editItemI
+                                            et
+                                            (item{itItem = ItemCard c{cardHolderName = new}})
+                                        )
+                            )
+                    )
+                ,
+                    ( "Number: " <> cardNumber
+                    , pure $
+                        editI
+                            "Number"
+                            [cardNumber]
+                            ( \case
+                                Right _ ->
+                                    pure
+                                        (editItemI et item)
+                                Left new ->
+                                    pure
+                                        ( editItemI
+                                            et
+                                            (item{itItem = ItemCard c{cardNumber = new}})
+                                        )
+                            )
+                    )
+                ,
+                    ( "Security Code: " <> cardCode
+                    , pure $
+                        editI
+                            "Security Code"
+                            [cardCode]
+                            ( \case
+                                Right _ -> pure (editItemI et item)
+                                Left new -> pure (editItemI et (item{itItem = ItemCard c{cardCode = new}}))
+                            )
+                    )
+                ]
+            ItemIdentity _ -> []
+            ItemSecureNote _ -> []
 
 editI :: Text -> [Text] -> (Either Text Option -> App Interaction) -> Interaction
 editI prompt olds next =
     InteractionQuestion $
         Question (Prompt [ArgPrompt prompt]) (coerce olds) next
-
-specificEditItemOptions :: ItemTemplate -> [(Option, App Interaction)]
-specificEditItemOptions old =
-    first Option <$> case itItem old of
-        (ItemLogin l@Login{..}) ->
-            [
-                ( "Username: " <> fromMaybe "None" loginUsername
-                , pure $
-                    editI
-                        "Username"
-                        [fromMaybe "" loginUsername]
-                        ( \case
-                            Right _ -> pure (editItemI old)
-                            Left new ->
-                                pure
-                                    ( editItemI
-                                        (old{itItem = ItemLogin l{loginUsername = Just new}})
-                                    )
-                        )
-                )
-            ,
-                ( "Password: " <> fromMaybe "None" loginPassword
-                , do
-                    mpw <- generatePassword
-                    case mpw of
-                        Just pw ->
-                            pure
-                                ( editItemI
-                                    (old{itItem = ItemLogin l{loginPassword = Just pw}})
-                                )
-                        Nothing -> pure (editItemI old)
-                )
-            ]
-        --                <> case fmap (zip [1 :: Int ..]) loginUris of
-        --                    Just uris ->
-        --                        [ ("URL" <> Text.pack (show i) <> ": " <> coerce url, lift (openInBrowser_ (coerce url)))
-        --                        | (i, url) <- uris
-        --                        ]
-        --                    Nothing -> []
-        ItemCard c@Card{..} ->
-            [
-                ( "Cardholder Name: " <> cardHolderName
-                , pure $
-                    editI
-                        "Cardholder Name"
-                        [cardHolderName]
-                        ( \case
-                            Right _ -> pure (editItemI old)
-                            Left new ->
-                                pure
-                                    ( editItemI
-                                        (old{itItem = ItemCard c{cardHolderName = new}})
-                                    )
-                        )
-                )
-            ,
-                ( "Number: " <> cardNumber
-                , pure $
-                    editI
-                        "Number"
-                        [cardNumber]
-                        ( \case
-                            Right _ ->
-                                pure
-                                    (editItemI old)
-                            Left new ->
-                                pure
-                                    ( editItemI
-                                        (old{itItem = ItemCard c{cardNumber = new}})
-                                    )
-                        )
-                )
-            ,
-                ( "Security Code: " <> cardCode
-                , pure $
-                    editI
-                        "Security Code"
-                        [cardCode]
-                        ( \case
-                            Right _ -> pure (editItemI old)
-                            Left new -> pure (editItemI (old{itItem = ItemCard c{cardCode = new}}))
-                        )
-                )
-            ]
-        ItemIdentity _ -> []
-        ItemSecureNote _ -> []
 
 loginI :: Interaction
 loginI =
@@ -634,8 +703,8 @@ dashboardI items =
                         Just item -> typeItemI item
                         Nothing   -> announceI "No previous entry"
                 )
-            , ("Edit entries", allItemsI editItemI <$> getItems)
-            , ("Add entry", pure InteractionEnd)
+            , ("Edit entries", allItemsI (editItemI Update) <$> getItems)
+            , ("Add entry", pure addNewItemI)
             , ("Manage folders", pure InteractionEnd)
             , ("Manage collections", pure InteractionEnd)
             , ("Sync vault", pure InteractionEnd)
@@ -663,8 +732,59 @@ dashboardI items =
                 _ -> announce "No username or password"
             >> pure InteractionEnd
 
-announce :: Text -> App ()
-announce = interactionLoop . announceI
+addNewItemI :: Interaction
+addNewItemI =
+    InteractionQuestion $
+        Question
+            (Prompt [ArgPrompt "Item Type"])
+            (fst <$> options)
+            ( \case
+                Left _ -> pure InteractionEnd
+                Right o -> case o `lookup` options of
+                    Nothing -> pure InteractionEnd
+                    Just i  -> i
+            )
+  where
+    options :: [(Option, App Interaction)]
+    options =
+        first Option
+            <$> [
+                    ( "Login"
+                    , editItemI Create . emptyItem <$> pickFolder
+                    )
+                , ("Secure Note", pure InteractionEnd)
+                , ("Card", pure InteractionEnd)
+                , ("Identity", pure InteractionEnd)
+                ]
+
+    emptyItem :: Folder -> ItemTemplate
+    emptyItem folder =
+        ItemTemplate
+            { itId = ""
+            , itFolderId = Just (unFolder folder)
+            , itTitle = ""
+            , itNotes = Nothing
+            , itFavorite = False
+            , itItem =
+                ItemLogin
+                    ( Login
+                        { loginUris = Nothing
+                        , loginUsername = Nothing
+                        , loginPassword = Nothing
+                        , loginTotp = Nothing
+                        }
+                    )
+            }
+
+    pickFolder :: App Folder
+    pickFolder = do
+        Menu menu <- asks envMenu
+        folders <- getFolders
+        Right (Option f) <- lift $ menu (Prompt [ArgPrompt "Folder"]) (coerce folders)
+        return (Folder f)
+
+addNewItemI' :: Interaction
+addNewItemI' = InteractionQuestion $ Question (Prompt []) [] (const $ pure InteractionEnd)
 
 announceI :: Text -> Interaction
 announceI a =
@@ -673,6 +793,9 @@ announceI a =
             (Prompt [ArgPrompt a])
             []
             (const $ pure InteractionEnd)
+
+announce :: Text -> App ()
+announce = interactionLoop . announceI
 
 allItemsI :: (ItemTemplate -> Interaction) -> [ItemTemplate] -> Interaction
 allItemsI interaction items =
@@ -696,7 +819,7 @@ main = do
     baseUrl <- parseBaseUrl "http://localhost:8087"
     let env = mkClientEnv manager baseUrl
 
-    shelly $ runReaderT app (Env env (Menu dmenu))
+    shelly $ verbosely $ runReaderT app (Env env (Menu dmenu))
 
 app :: App ()
 app = do
@@ -767,7 +890,11 @@ generatePassword = do
     Menu menu <- asks envMenu
     Right (Option m) <- lift $ menu (Prompt [ArgPrompt "Method"]) [Option "Generate", Option "Manual"]
     case m of
-        "Manual" -> lift $ menu (Prompt [ArgPrompt "Password"]) [] >>= \(Left newPw) -> pure (Just newPw)
+        "Manual" ->
+            lift $
+                menu (Prompt [ArgPrompt "Password"]) [] >>= \case
+                    Left newPw -> pure (Just newPw)
+                    Right _ -> pure Nothing
         "Generate" -> do
             len <- lift $ either id coerce <$> menu (Prompt [ArgPrompt "Length"]) [Option "20"]
             Right (Option s) <- lift $ menu (Prompt [ArgPrompt "Include special?"]) [Option "Yes", Option "No"]
