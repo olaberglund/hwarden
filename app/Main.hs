@@ -24,6 +24,7 @@ import           Data.Ord                   (comparing)
 import           Data.Text                  (Text)
 import qualified Data.Text                  as Text
 import           Data.Time                  (UTCTime)
+import           Debug.Trace                (traceShow, traceShowId)
 import           GHC.Generics               (Generic)
 import           Network.HTTP.Client        (defaultManagerSettings, newManager)
 import           Prelude                    hiding (log)
@@ -36,11 +37,12 @@ import           Servant.Client             (AsClientT, ClientEnv,
                                              Response, client, mkClientEnv,
                                              parseBaseUrl, responseBody,
                                              runClientM, (//))
-import           Shelly                     (Sh, errorExit, exit, fromText,
-                                             get_env, liftIO, readfile, run,
-                                             run_, setStdin, shelly, silently,
-                                             toTextIgnore, verbosely,
-                                             withTmpDir, writefile, (<.>))
+import           Shelly                     (Sh, echo, errorExit, exit,
+                                             fromText, get_env, liftIO,
+                                             readfile, run, run_, setStdin,
+                                             shelly, silently, toTextIgnore,
+                                             verbosely, withTmpDir, writefile,
+                                             (<.>))
 import           Text.Read                  (readMaybe)
 
 default (Text)
@@ -73,7 +75,7 @@ readCache = withCacheFile readfile
 handleClientError :: ClientError -> Text
 handleClientError clientError =
     case clientError of
-        (DecodeFailure _df _)           -> "Decode failure"
+        (DecodeFailure df _)            -> traceShow df "Decode failure"
         (ConnectionError _)             -> "Connection error"
         (UnsupportedContentType _ _res) -> "Unsupported content type"
         (InvalidContentTypeHeader _res) -> "Invalid content type header"
@@ -85,12 +87,7 @@ handleClientError clientError =
             . coerce
             . decode @VaultFailureResponse
             . responseBody
-
-askPassword :: Sh Password
-askPassword = silently $ Password . head . Text.lines <$> run "dmenu" args
-  where
-    obscureColor = "#222222"
-    args = ["-p", "Enter Password ", "-nb", obscureColor, "-nf", obscureColor]
+            . traceShowId
 
 login :: Password -> App UnlockData
 login = callApi . (vaultClient // lockingEp // unlockEp)
@@ -284,12 +281,12 @@ toSymbol = \case
     ItemSecureNote _ -> "(n)"
 
 instance ToEntry ItemTemplate where
-    toEntry (ItemTemplate _ _ name _ _ item) =
-        mappend (toSymbol item <> " " <> name) $
+    toEntry ItemTemplate{..} =
+        mappend (toSymbol itItem <> " " <> itTitle) $
             (\t -> if Text.null t then "" else " - " <> t) $
                 merge $
-                    case item of
-                        ItemLogin itemLogin -> catMaybes [loginUsername itemLogin] <> maybe [] coerce (loginUris itemLogin)
+                    case itItem of
+                        ItemLogin itemLogin -> catMaybes [loginUsername itemLogin] <> maybe [] (map unUri) (loginUris itemLogin)
                         ItemCard Card{..} -> [Text.take 5 cardNumber <> "..."]
                         ItemIdentity _ -> []
                         ItemSecureNote _ -> []
@@ -313,28 +310,54 @@ newtype Folder = Folder
     deriving (Show, Eq)
 
 data ItemTemplate = ItemTemplate
-    { itId       :: Text
-    , itFolderId :: Maybe Text
-    , itTitle    :: Text
-    , itNotes    :: Maybe Text
-    , itFavorite :: Bool
-    , itItem     :: Item
+    { itId            :: Text
+    , itOrgId         :: Maybe Text
+    , itCollectionIds :: [Text]
+    , itType          :: Int
+    , itFolderId      :: Maybe Text
+    , itTitle         :: Text
+    , itFields        :: Maybe [Field]
+    , itNotes         :: Maybe Text
+    , itRePrompt      :: Bool
+    , itFavorite      :: Bool
+    , itItem          :: Item
     }
     deriving (Show, Eq)
 
 instance Ord ItemTemplate where
     compare = comparing itItem <> comparing itTitle
 
-newtype Uri = Uri
-    { unUri :: Text
+data Field = Field
+    { fieldName  :: Text
+    , fieldValue :: Text
+    , fieldType  :: Int
+    }
+    deriving (Show, Eq)
+
+instance FromJSON Field where
+    parseJSON = withObject "Field" $ \o ->
+        Field <$> o .: "name" <*> o .: "value" <*> o .: "type"
+
+instance ToJSON Field where
+    toJSON (Field{..}) =
+        object
+            [ "name" .= fieldName
+            , "value" .= fieldValue
+            , "type" .= fieldType
+            ]
+
+data Uri = Uri
+    { unUri    :: Text
+    , uriMatch :: Maybe Int
     }
     deriving stock (Show, Eq, Ord)
 
 instance FromJSON Uri where
-    parseJSON = withObject "Uri" $ \o -> Uri <$> o .: "uri"
+    parseJSON = withObject "Uri" $ \o ->
+        Uri <$> o .: "uri" <*> o .: "match"
 
 instance ToJSON Uri where
-    toJSON (Uri uri) = object ["uri" .= uri]
+    toJSON (Uri uri match) = object ["uri" .= uri, "match" .= match]
 
 data Login = Login
     { loginUris     :: Maybe [Uri]
@@ -397,19 +420,26 @@ instance FromJSON Identity where
 
 instance FromJSON ItemTemplate where
     parseJSON = withObject "ItemTemplate" $ \o -> do
-        itId :: Text <- o .: "id"
-        itType :: Int <- o .: "type"
+        itId <- o .: "id"
+        itOrgId <- o .: "organizationId"
+        itCollectionIds <- o .: "collectionIds"
+        itType <- o .: "type"
         itFolderId <- o .: "folderId"
-        itName <- o .: "name"
+        itTitle <- o .: "name"
         itNotes <- o .: "notes"
         itFavorite <- o .: "favorite"
-        let item = ItemTemplate itId itFolderId itName itNotes itFavorite
-        case itType of
-            1 -> item . ItemLogin <$> o .: "login"
-            2 -> item . ItemSecureNote <$> o .: "secureNote"
-            3 -> item . ItemCard <$> o .: "card"
-            4 -> item . ItemIdentity <$> o .: "identity"
+        itFields <- o .:? "fields"
+        reprompt :: Int <- o .: "reprompt"
+        let itRePrompt = case reprompt of
+                1 -> True
+                _ -> False
+        itItem <- case itType of
+            1 -> ItemLogin <$> o .: "login"
+            2 -> ItemSecureNote <$> o .: "secureNote"
+            3 -> ItemCard <$> o .: "card"
+            4 -> ItemIdentity <$> o .: "identity"
             _ -> fail "Invalid item type"
+        return $ ItemTemplate{..}
 
 instance ToJSON ItemTemplate where
     toJSON ItemTemplate{..} =
@@ -418,6 +448,11 @@ instance ToJSON ItemTemplate where
             , "name" .= itTitle
             , "notes" .= itNotes
             , "favorite" .= itFavorite
+            , "id" .= itId
+            , "organizationId" .= itOrgId
+            , "collectionIds" .= itCollectionIds
+            , "type" .= itType
+            , "fields" .= itFields
             , case itItem of
                 ItemLogin l      -> "login" .= l
                 ItemSecureNote _ -> "secureNote" .= ()
@@ -490,8 +525,8 @@ specificTypeItemOptions item =
             ]
                 <> case fmap (zip [1 :: Int ..]) loginUris of
                     Just uris ->
-                        [ ( "URL" <> Text.pack (show i) <> ": " <> coerce url
-                          , lift (openInBrowser_ (coerce url))
+                        [ ( "URL" <> Text.pack (show i) <> ": " <> unUri url
+                          , lift (openInBrowser_ (unUri url))
                           )
                         | (i, url) <- uris
                         ]
@@ -601,13 +636,16 @@ editItemI et item@(ItemTemplate{..}) =
                                     )
                             Nothing -> pure (editItemI et item)
                     )
+                ,
+                    ( "URLs: <Enter to edit>"
+                    , do
+                        Menu menu <- asks envMenu
+                        url <- lift $ menu (Prompt [ArgPrompt "Edit or add new by typing"]) (Option . unUri <$> fromMaybe [] loginUris)
+                        case url of
+                            Right (Option url) -> undefined
+                            Left newUrl -> pure (editItemI et (item{itItem = ItemLogin l{loginUris = (Uri newUrl Nothing :) <$> loginUris}}))
+                    )
                 ]
-            --                <> case fmap (zip [1 :: Int ..]) loginUris of
-            --                    Just uris ->
-            --                        [ ("URL" <> Text.pack (show i) <> ": " <> coerce url, lift (openInBrowser_ (coerce url)))
-            --                        | (i, url) <- uris
-            --                        ]
-            --                    Nothing -> []
             ItemCard c@Card{..} ->
                 [
                     ( "Cardholder Name: " <> cardHolderName
@@ -750,30 +788,38 @@ addNewItemI =
         first Option
             <$> [
                     ( "Login"
-                    , editItemI Create . emptyItem <$> pickFolder
+                    , editItemI Create
+                        . emptyItem
+                            ( ItemLogin
+                                ( Login
+                                    { loginUris = Nothing
+                                    , loginUsername = Nothing
+                                    , loginPassword = Nothing
+                                    , loginTotp = Nothing
+                                    }
+                                )
+                            )
+                        <$> pickFolder
                     )
                 , ("Secure Note", pure InteractionEnd)
                 , ("Card", pure InteractionEnd)
                 , ("Identity", pure InteractionEnd)
                 ]
 
-    emptyItem :: Folder -> ItemTemplate
-    emptyItem folder =
+    emptyItem :: Item -> Folder -> ItemTemplate
+    emptyItem item folder =
         ItemTemplate
             { itId = ""
+            , itOrgId = Nothing
+            , itCollectionIds = []
             , itFolderId = Just (unFolder folder)
+            , itType = itemToType item
             , itTitle = ""
+            , itFields = Nothing
+            , itRePrompt = False
             , itNotes = Nothing
             , itFavorite = False
-            , itItem =
-                ItemLogin
-                    ( Login
-                        { loginUris = Nothing
-                        , loginUsername = Nothing
-                        , loginPassword = Nothing
-                        , loginTotp = Nothing
-                        }
-                    )
+            , itItem = item
             }
 
     pickFolder :: App Folder
@@ -793,6 +839,13 @@ announceI a =
             (Prompt [ArgPrompt a])
             []
             (const $ pure InteractionEnd)
+
+itemToType :: Item -> Int
+itemToType item = case item of
+    ItemLogin _      -> 1
+    ItemSecureNote _ -> 2
+    ItemCard _       -> 3
+    ItemIdentity _   -> 4
 
 announce :: Text -> App ()
 announce = interactionLoop . announceI
