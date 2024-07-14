@@ -19,6 +19,10 @@ main = do
 
     shelly $ verbosely $ runReaderT app (Env env (Menu dmenu))
 
+-- doesn't show password in logs
+-- signifcantly faster, uses bw serve
+-- case insensitivty
+-- Force user to choose name first for any item (required)
 app :: App ()
 app = do
     status <- getStatus
@@ -30,8 +34,3 @@ app = do
     items <- getItems
 
     interactionLoop (dashboardI items)
-
--- doesn't show password in logs
--- signifcantly faster, uses bw serve
--- case insensitivty
--- Force user to choose name first for any item (required)

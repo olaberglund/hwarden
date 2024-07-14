@@ -18,10 +18,9 @@ import           Data.Bifunctor             (Bifunctor (first), bimap)
 import           Data.Coerce                (Coercible, coerce)
 import           Data.Foldable              (for_)
 import           Data.List                  (find)
-import           Data.Maybe                 (catMaybes, fromMaybe)
+import           Data.Maybe                 (catMaybes, fromMaybe, isJust)
 import           Data.Text                  (Text)
 import qualified Data.Text                  as Text
-import           Debug.Trace                (traceShow)
 import           Env
 import           Item
 import           Menu
@@ -157,8 +156,7 @@ dashboardI items =
                 )
             , ("Edit entries", allItemsI (editItemI Update) <$> getItems)
             , ("Add entry", pure addNewItemI)
-            , ("Manage folders", pure InteractionEnd)
-            , ("Manage collections", pure InteractionEnd)
+            , ("Manage folders", pure manageFoldersI)
             , ("Sync vault", sync >> pure InteractionEnd)
             , ("Switch vaults", pure InteractionEnd)
             , ("Lock vault", logout >> pure InteractionEnd)
@@ -413,8 +411,8 @@ editItemI et item@(ItemTemplate{..}) =
                         pure $
                             editI
                                 "Folder"
-                                (Option . coerce <$> folders)
-                                ( edit (\new -> traceShow ("---- NEW: " <> new) (item{itFolderId = if new == "No Folder" then Nothing else Just new}))
+                                (Option . folderName <$> folders)
+                                ( edit (\new -> item{itFolderId = if new == "No Folder" then Nothing else Just new})
                                 )
                     )
                 ,
@@ -539,6 +537,61 @@ editI prompt olds next =
     InteractionQuestion $
         Question (Prompt [ArgPrompt prompt]) (coerce olds) next
 
+manageFoldersI :: Interaction
+manageFoldersI =
+    InteractionQuestion $
+        Question
+            (Prompt [ArgPrompt "Manage Folders"])
+            (fst <$> options)
+            ( \case
+                Left _ -> pure InteractionEnd
+                Right i -> case i `lookup` options of
+                    Nothing -> pure InteractionEnd
+                    Just i' -> i'
+            )
+  where
+    options :: [(Option, App Interaction)]
+    options =
+        [
+            ( Option "Create"
+            , do
+                Menu menu <- asks envMenu
+                Left name <- lift $ menu (Prompt [ArgPrompt "Folder name"]) []
+                void $ callApi ((vaultClient // foldersEp // addFolderEp) (FolderName name))
+                pure manageFoldersI
+            )
+        ,
+            ( Option "Rename"
+            , do
+                Menu menu <- asks envMenu
+                folder <- pickFolder "Rename folder"
+                case folderId folder of
+                    Just fid -> do
+                        opt <- lift $ menu (Prompt [ArgPrompt "Rename folder"]) [Option (folderName folder)]
+                        case opt of
+                            Left name -> case name of
+                                "" -> pure $ announceI "Name can not be empty"
+                                name' -> do
+                                    void $ callApi ((vaultClient // foldersEp // editFolderEp) fid (FolderName name'))
+                                    pure manageFoldersI
+                            _ -> pure manageFoldersI
+                    Nothing -> pure manageFoldersI
+            )
+        ,
+            ( Option "Delete"
+            , do
+                Menu menu <- asks envMenu
+                folders <- getFolders
+                let folderOptions = map ((,) <$> folderName <*> folderId) folders
+                Right (Option name) <- lift $ menu (Prompt [ArgPrompt "Folder name"]) (Option . fst <$> folderOptions)
+                case name `lookup` folderOptions of
+                    Just fid -> do
+                        void $ callApi ((vaultClient // foldersEp // deleteFolderEp) (fromMaybe "" fid))
+                        pure manageFoldersI
+                    Nothing -> pure manageFoldersI
+            )
+        ]
+
 login :: Password -> App UnlockData
 login = mapReaderT (fmap coerce) . callApi . (vaultClient // lockingEp // unlockEp)
 
@@ -556,3 +609,12 @@ getStatus = mapReaderT (fmap coerce) $ callApi (vaultClient // miscEp // statusE
 
 getFolders :: App [Folder]
 getFolders = mapReaderT (fmap coerce) $ callApi (vaultClient // foldersEp // getFoldersEp)
+
+pickFolder :: Text -> App Folder
+pickFolder prompt = do
+    Menu menu <- asks envMenu
+    folders <- getFolders
+    Right (Option f) <- lift $ menu (Prompt [ArgPrompt prompt]) (Option . folderName <$> filter (isJust . folderId) folders)
+    case find ((== f) . folderName) folders of
+        Just folder -> pure folder
+        Nothing     -> pickFolder prompt

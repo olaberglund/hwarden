@@ -16,6 +16,7 @@ import           Data.Maybe     (fromMaybe)
 import           Data.Text      (Text)
 import qualified Data.Text      as Text
 import           Data.Time      (UTCTime)
+import           Debug.Trace
 import           GHC.Generics   (Generic)
 import           Item           (Item (..), ItemTemplate)
 import           Prelude        hiding (log)
@@ -41,6 +42,7 @@ handleClientError clientError =
             . coerce
             . decode @VaultFailureResponse
             . responseBody
+            . traceShowId
 
 type Todo = PostNoContent
 
@@ -134,8 +136,11 @@ data VaultItemsApi as = VaultItemsApi
     }
     deriving stock (Generic)
 
-newtype VaultFoldersApi as = VaultFoldersApi
+data VaultFoldersApi as = VaultFoldersApi
     { getFoldersEp :: as :- "list" :> "object" :> "folders" :> Get '[JSON] (VaultResponse FoldersData)
+    , addFolderEp :: as :- "object" :> "folder" :> ReqBody '[JSON] FolderName :> Post '[JSON] (VaultResponse Folder)
+    , editFolderEp :: as :- "object" :> "folder" :> Capture "id" Text :> ReqBody '[JSON] FolderName :> Put '[JSON] (VaultResponse Folder)
+    , deleteFolderEp :: as :- "object" :> "folder" :> Capture "id" Text :> Delete '[JSON] EmptyVaultResponse
     }
     deriving stock (Generic)
 
@@ -204,9 +209,6 @@ instance FromJSON GenerateData where
 callApiIO :: ClientM a -> ClientEnv -> IO (Either Text a)
 callApiIO action env = first handleClientError <$> runClientM action env
 
-instance FromJSON Folder where
-    parseJSON = withObject "Folder" $ \o -> Folder <$> o .: "name"
-
 newtype FoldersData = FoldersData
     { unFoldersData :: [Folder]
     }
@@ -214,10 +216,29 @@ newtype FoldersData = FoldersData
 
 instance FromJSON FoldersData where
     parseJSON = withObject "FoldersData" $ \o -> FoldersData <$> o .: "data"
-newtype Folder = Folder
-    { unFolder :: Text
+
+data Folder = Folder
+    { folderId   :: Maybe Text -- The 'No Folder' has no id
+    , folderName :: Text
     }
     deriving (Show, Eq)
+
+instance FromJSON Folder where
+    parseJSON = withObject "Folder" $ \o -> do
+        folderId <- o .: "id"
+        folderName <- o .: "name"
+        return Folder{..}
+
+instance ToJSON Folder where
+    toJSON Folder{..} = object ["name" .= folderName, "id" .= folderId]
+
+newtype FolderName = FolderName
+    { unFolderName :: Text
+    }
+    deriving (Show, Eq)
+
+instance ToJSON FolderName where
+    toJSON (FolderName name) = object ["name" .= name]
 
 itemToType :: Item -> Int
 itemToType item = case item of
