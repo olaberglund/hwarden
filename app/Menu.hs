@@ -12,6 +12,7 @@ module Menu (
 
 import           Data.Coerce (coerce)
 import           Data.List   (foldl')
+import           Data.Maybe  (fromMaybe)
 import           Data.Text   (Text)
 import qualified Data.Text   as Text
 import           Prelude     hiding (log)
@@ -49,8 +50,12 @@ dmenu prompt options = do
 
     setStdin ls
     sel <- run "dmenu" args
-    let line = head (Text.lines sel)
+    let line = fromMaybe "" $ safeHead (Text.lines sel)
     pure $
         if line `elem` map coerce options
             then Right (Option line)
             else Left line
+
+safeHead :: [a] -> Maybe a
+safeHead (x : _) = Just x
+safeHead _       = Nothing

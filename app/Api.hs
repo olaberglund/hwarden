@@ -16,7 +16,6 @@ import           Data.Maybe     (fromMaybe)
 import           Data.Text      (Text)
 import qualified Data.Text      as Text
 import           Data.Time      (UTCTime)
-import           Debug.Trace
 import           GHC.Generics   (Generic)
 import           Item           (Item (..), ItemTemplate)
 import           Prelude        hiding (log)
@@ -42,15 +41,15 @@ handleClientError clientError =
             . coerce
             . decode @VaultFailureResponse
             . responseBody
-            . traceShowId
 
 type Todo = PostNoContent
 
 data VaultApi as = VaultApi
-    { lockingEp :: as :- NamedRoutes VaultLockApi
-    , itemsEp   :: as :- NamedRoutes VaultItemsApi
-    , foldersEp :: as :- NamedRoutes VaultFoldersApi
-    , miscEp    :: as :- NamedRoutes VaultMiscellaneousApi
+    { lockingEp     :: as :- NamedRoutes VaultLockApi
+    , itemsEp       :: as :- NamedRoutes VaultItemsApi
+    , foldersEp     :: as :- NamedRoutes VaultFoldersApi
+    , miscEp        :: as :- NamedRoutes VaultMiscellaneousApi
+    , collectionsEp :: as :- NamedRoutes VaultCollectionsApi
     }
     deriving stock (Generic)
 
@@ -137,15 +136,21 @@ data VaultItemsApi as = VaultItemsApi
     deriving stock (Generic)
 
 data VaultFoldersApi as = VaultFoldersApi
-    { getFoldersEp :: as :- "list" :> "object" :> "folders" :> Get '[JSON] (VaultResponse FoldersData)
+    { getFoldersEp :: as :- "list" :> "object" :> "folders" :> Get '[JSON] (VaultResponse (DataObject [Folder]))
     , addFolderEp :: as :- "object" :> "folder" :> ReqBody '[JSON] FolderName :> Post '[JSON] (VaultResponse Folder)
     , editFolderEp :: as :- "object" :> "folder" :> Capture "id" Text :> ReqBody '[JSON] FolderName :> Put '[JSON] (VaultResponse Folder)
     , deleteFolderEp :: as :- "object" :> "folder" :> Capture "id" Text :> Delete '[JSON] EmptyVaultResponse
     }
     deriving stock (Generic)
 
+data VaultCollectionsApi as = VaultCollectionsApi
+    { addCollectionEp :: as :- "object" :> "org-collection" :> QueryParam "organizationId" Text :> ReqBody '[JSON] CollectionBody :> Post '[JSON] (VaultResponse Collection)
+    , getOrganizationsEp :: as :- "list" :> "object" :> "organizations" :> Get '[JSON] (VaultResponse (DataObject [Organization]))
+    }
+    deriving stock (Generic)
+
 data VaultMiscellaneousApi as = VaultMiscellaneousApi
-    { statusEp :: as :- "status" :> Get '[JSON] (VaultResponse StatusData)
+    { statusEp :: as :- "status" :> Get '[JSON] (VaultResponse Status)
     , syncEp :: as :- "sync" :> Post '[JSON] (VaultResponse TitledData)
     , generatePasswordEp ::
         as
@@ -155,16 +160,16 @@ data VaultMiscellaneousApi as = VaultMiscellaneousApi
                 :> QueryFlag "lowercase"
                 :> QueryFlag "number"
                 :> QueryFlag "special"
-                :> Get '[JSON] (VaultResponse GenerateData)
+                :> Get '[JSON] (VaultResponse (DataObject Text))
     }
     deriving stock (Generic)
 
-data StatusData = StatusData
-    { statusDataServerUrl :: Maybe Text
-    , statusDataLastSync  :: UTCTime
-    , statusDataUserEmail :: Text
-    , statusDataUserId    :: Text
-    , statusDataStatus    :: LockStatus
+data Status = Status
+    { statusServerUrl  :: Maybe Text
+    , statusLastSync   :: UTCTime
+    , statusUserEmail  :: Text
+    , statusUserId     :: Text
+    , statusLockStatus :: LockStatus
     }
     deriving stock (Show, Eq)
 
@@ -177,16 +182,16 @@ instance FromJSON LockStatus where
         "unlocked" -> pure Unlocked
         s -> fail ("Invalid lock status: " <> Text.unpack s)
 
-instance FromJSON StatusData where
+instance FromJSON Status where
     parseJSON =
-        withObject "StatusData" $
+        withObject "Status" $
             (.: "template") >=> \t -> do
-                statusDataServerUrl <- t .: "serverUrl"
-                statusDataLastSync <- t .: "lastSync"
-                statusDataUserEmail <- t .: "userEmail"
-                statusDataUserId <- t .: "userId"
-                statusDataStatus <- t .: "status"
-                pure StatusData{..}
+                statusServerUrl <- t .: "serverUrl"
+                statusLastSync <- t .: "lastSync"
+                statusUserEmail <- t .: "userEmail"
+                statusUserId <- t .: "userId"
+                statusLockStatus <- t .: "status"
+                pure Status{..}
 
 newtype ItemsData = ItemsData
     { unItemsData :: [ItemTemplate]
@@ -197,25 +202,99 @@ instance FromJSON ItemsData where
     parseJSON = withObject "ItemsData" $
         \o -> ItemsData <$> o .: "data"
 
-newtype GenerateData = GenerateData
-    { unGenerateData :: Text
-    }
-    deriving stock (Show, Eq)
-
-instance FromJSON GenerateData where
-    parseJSON = withObject "GenerateData" $
-        \o -> GenerateData <$> o .: "data"
-
 callApiIO :: ClientM a -> ClientEnv -> IO (Either Text a)
 callApiIO action env = first handleClientError <$> runClientM action env
 
-newtype FoldersData = FoldersData
-    { unFoldersData :: [Folder]
+data Organization = Organization
+    { organizationId   :: Text
+    , organizationName :: Text
     }
     deriving stock (Show, Eq)
 
-instance FromJSON FoldersData where
-    parseJSON = withObject "FoldersData" $ \o -> FoldersData <$> o .: "data"
+instance FromJSON Organization where
+    parseJSON = withObject "Organization" $ \o -> do
+        organizationId <- o .: "id"
+        organizationName <- o .: "name"
+        return Organization{..}
+
+data Collection = Collection
+    { collectionOrgId :: Text
+    , collectionName  :: Text
+    , groups          :: [CollectionGroup]
+    }
+    deriving stock (Show, Eq)
+
+data CollectionGroup = CollectionGroup
+    { collectionGroupId            :: Text
+    , collectionGroupReadOnly      :: Bool
+    , collectionGroupHidePasswords :: Bool
+    }
+    deriving stock (Show, Eq)
+
+data CollectionMember = CollectionMember
+    { collectionMemberId            :: Text
+    , collectionMemberReadOnly      :: Bool
+    , collectionMemberHidePasswords :: Bool
+    , collectionManage              :: Bool
+    }
+    deriving stock (Show, Eq)
+
+instance ToJSON CollectionMember where
+    toJSON CollectionMember{..} =
+        object
+            [ "id" .= collectionMemberId
+            , "readOnly" .= collectionMemberReadOnly
+            , "hidePasswords" .= collectionMemberHidePasswords
+            , "manage" .= collectionManage
+            ]
+
+data CollectionBody = CollectionBody
+    { collectionBodyOrgId            :: Text
+    , collectionBodyName             :: Text
+    , collectionBodyCollectionGroups :: [CollectionGroup]
+    , collectionBodyUsers            :: [CollectionMember]
+    }
+    deriving stock (Show, Eq)
+
+instance ToJSON CollectionBody where
+    toJSON CollectionBody{..} =
+        object
+            [ "name" .= collectionBodyName
+            , "organizationId" .= collectionBodyOrgId
+            , "groups" .= collectionBodyCollectionGroups
+            , "externalId" .= (Nothing :: Maybe Text)
+            , "users" .= collectionBodyUsers
+            ]
+
+instance FromJSON Collection where
+    parseJSON = withObject "Collection" $ \o -> do
+        collectionOrgId <- o .: "orgId"
+        collectionName <- o .: "name"
+        groups <- o .: "groups"
+        return Collection{..}
+
+instance ToJSON CollectionGroup where
+    toJSON CollectionGroup{..} =
+        object
+            [ "id" .= collectionGroupId
+            , "readOnly" .= collectionGroupReadOnly
+            , "hidePasswords" .= collectionGroupHidePasswords
+            ]
+
+instance FromJSON CollectionGroup where
+    parseJSON = withObject "CollectionGroup" $ \o -> do
+        collectionGroupId <- o .: "id"
+        collectionGroupReadOnly <- o .: "readOnly"
+        collectionGroupHidePasswords <- o .: "hidePasswords"
+        return CollectionGroup{..}
+
+newtype DataObject a = DataObject
+    { unDataObject :: a
+    }
+    deriving stock (Show, Eq)
+
+instance (FromJSON a) => FromJSON (DataObject a) where
+    parseJSON = withObject "DataObject" $ \o -> DataObject <$> o .: "data"
 
 data Folder = Folder
     { folderId   :: Maybe Text -- The 'No Folder' has no id

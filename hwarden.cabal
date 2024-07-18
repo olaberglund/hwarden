@@ -75,6 +75,7 @@ executable hwarden
   -- Other library packages from which modules are imported.
   build-depends:
     , aeson
+    , async
     , base            ^>=4.18.2.1
     , bytestring
     , containers
@@ -82,6 +83,7 @@ executable hwarden
     , servant-client
     , servant-server
     , shelly
+    , shelly-extra
     , text
     , time
     , transformers

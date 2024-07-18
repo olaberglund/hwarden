@@ -6,8 +6,9 @@ module Interaction (
     dashboardI,
     getItems,
     getStatus,
-    loginI,
+    unlockI,
     interactionLoop,
+    unlock,
 ) where
 
 import           Api
@@ -42,6 +43,18 @@ data Question = Question
 
 typeItemI :: ItemTemplate -> Interaction
 typeItemI item =
+    InteractionQuestion $
+        Question
+            (Prompt [ArgPrompt "Entries"])
+            (fst <$> typeItemOptions item)
+            ( \case
+                Left _ -> pure InteractionEnd
+                Right i -> case i `lookup` typeItemOptions item of
+                    Nothing -> pure InteractionEnd
+                    Just i' -> i'
+            )
+
+typeItemI' item =
     InteractionQuestion $
         Question
             (Prompt [ArgPrompt "Entries"])
@@ -114,15 +127,15 @@ specificTypeItemOptions item =
 paste' :: Text -> Maybe Text -> (Text, App ())
 paste' k v = (k <> ": " <> fromMaybe "None" v, lift (for_ v paste))
 
-loginI :: Interaction
-loginI =
+unlockI :: Interaction
+unlockI =
     InteractionQuestion $
         Question
             (Prompt [ArgPrompt "Enter Password", ArgObscured])
             []
             ( \case
                 Right _ -> pure InteractionEnd
-                Left pw -> login (Password pw) >> pure InteractionEnd
+                Left pw -> unlock (Password pw) >> pure InteractionEnd
             )
 
 dashboardI :: [ItemTemplate] -> Interaction
@@ -150,16 +163,16 @@ dashboardI items =
                 , do
                     itemId <- lift readCache
                     let cachedItem = find ((== itemId) . itId) items
-                    pure $ case cachedItem of
-                        Just item -> typeItemI item
-                        Nothing   -> announceI "No previous entry"
+                    case cachedItem of
+                        Just item -> pure (typeItemI item)
+                        Nothing -> announce "No previous entry" >> pure (dashboardI items)
                 )
             , ("Edit entries", allItemsI (editItemI Update) <$> getItems)
             , ("Add entry", pure addNewItemI)
             , ("Manage folders", pure manageFoldersI)
-            , ("Sync vault", sync >> pure InteractionEnd)
-            , ("Switch vaults", pure InteractionEnd)
-            , ("Lock vault", logout >> pure InteractionEnd)
+            , ("Manage collections", pure manageCollectionsI)
+            , ("Sync vault", sync >> announce "Vault synced" >> pure (dashboardI items))
+            , ("Lock vault", logout >> announce "Vault locked" >> pure InteractionEnd)
             , ("-------- Quick actions --------", pure InteractionEnd)
             ]
                 <> map (\item -> (toEntry item, quickAction item)) items
@@ -537,6 +550,44 @@ editI prompt olds next =
     InteractionQuestion $
         Question (Prompt [ArgPrompt prompt]) (coerce olds) next
 
+manageCollectionsI :: Interaction
+manageCollectionsI =
+    InteractionQuestion $
+        Question
+            (Prompt [ArgPrompt "Manage Collections"])
+            (fst <$> options)
+            ( \case
+                Left _ -> pure InteractionEnd
+                Right i -> case i `lookup` options of
+                    Nothing -> pure InteractionEnd
+                    Just i' -> i'
+            )
+  where
+    options :: [(Option, App Interaction)]
+    options =
+        [
+            ( Option "Create"
+            , do
+                Menu menu <- asks envMenu
+                status <- getStatus
+                organizations <- coerce <$> callApi (vaultClient // collectionsEp // getOrganizationsEp)
+                let orgs = (,) <$> organizationName <*> organizationId <$> organizations
+                Right (Option chosenOrg) <- lift $ menu (Prompt [ArgPrompt "Select Organization"]) (Option . organizationName <$> organizations)
+                Left name <- lift $ menu (Prompt [ArgPrompt "Collection Name"]) []
+                case chosenOrg `lookup` orgs of
+                    Just orgId -> do
+                        void $
+                            callApi
+                                ( (vaultClient // collectionsEp // addCollectionEp)
+                                    (Just orgId)
+                                    (CollectionBody orgId name [] [CollectionMember (statusUserId status) False False True])
+                                )
+                        announce $ "Collection created: " <> name
+                        pure manageFoldersI
+                    Nothing -> pure $ announceI "Invalid organization"
+            )
+        ]
+
 manageFoldersI :: Interaction
 manageFoldersI =
     InteractionQuestion $
@@ -592,8 +643,8 @@ manageFoldersI =
             )
         ]
 
-login :: Password -> App UnlockData
-login = mapReaderT (fmap coerce) . callApi . (vaultClient // lockingEp // unlockEp)
+unlock :: Password -> App UnlockData
+unlock = mapReaderT (fmap coerce) . callApi . (vaultClient // lockingEp // unlockEp)
 
 logout :: App TitledData
 logout = mapReaderT (fmap coerce) $ callApi (vaultClient // lockingEp // lockEp)
@@ -604,7 +655,7 @@ sync = mapReaderT (fmap coerce) $ callApi (vaultClient // miscEp // syncEp)
 getItems :: App [ItemTemplate]
 getItems = mapReaderT (fmap coerce) $ callApi (vaultClient // itemsEp // getItemsEp)
 
-getStatus :: App StatusData
+getStatus :: App Status
 getStatus = mapReaderT (fmap coerce) $ callApi (vaultClient // miscEp // statusEp)
 
 getFolders :: App [Folder]

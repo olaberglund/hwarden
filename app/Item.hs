@@ -217,7 +217,7 @@ instance Ord ItemTemplate where
 
 data Field = Field
     { fieldName  :: Text
-    , fieldValue :: Text
+    , fieldValue :: Maybe Text
     , fieldType  :: Int
     }
     deriving (Show, Eq)
