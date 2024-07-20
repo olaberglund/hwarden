@@ -54,18 +54,6 @@ typeItemI item =
                     Just i' -> i'
             )
 
-typeItemI' item =
-    InteractionQuestion $
-        Question
-            (Prompt [ArgPrompt "Entries"])
-            (fst <$> typeItemOptions item)
-            ( \case
-                Left _ -> pure InteractionEnd
-                Right i -> case i `lookup` typeItemOptions item of
-                    Nothing -> pure InteractionEnd
-                    Just i' -> i'
-            )
-
 typeItemOptions :: ItemTemplate -> [(Option, App Interaction)]
 typeItemOptions (ItemTemplate{..}) =
     ( bimap Option (>> pure InteractionEnd)
@@ -172,7 +160,8 @@ dashboardI items =
             , ("Manage folders", pure manageFoldersI)
             , ("Manage collections", pure manageCollectionsI)
             , ("Sync vault", sync >> announce "Vault synced" >> pure (dashboardI items))
-            , ("Lock vault", logout >> announce "Vault locked" >> pure InteractionEnd)
+            , ("Lock vault", lock >> announce "Vault locked" >> pure InteractionEnd)
+            , ("Log out", lift (run_ "bw" ["logout"]) >> announce "Logged out" >> pure InteractionEnd)
             , ("-------- Quick actions --------", pure InteractionEnd)
             ]
                 <> map (\item -> (toEntry item, quickAction item)) items
@@ -441,10 +430,26 @@ editItemI et item@(ItemTemplate{..}) =
 
     miscOptions :: [(Option, App Interaction)]
     miscOptions = case et of
-        Create -> [(Option "Save entry", callApi ((vaultClient // itemsEp // addItemEp) item) >> pure InteractionEnd)]
+        Create ->
+            [
+                ( Option "Save entry"
+                , callApi ((vaultClient // itemsEp // addItemEp) item)
+                    >> pure InteractionEnd
+                )
+            ]
         Update ->
-            [ (Option "Delete entry", callApi ((vaultClient // itemsEp // deleteItemEp) itId) >> pure InteractionEnd)
-            , (Option "Save entry", callApi ((vaultClient // itemsEp // editItemEp) itId item) >> pure InteractionEnd)
+            [
+                ( Option "Delete entry"
+                , callApi ((vaultClient // itemsEp // deleteItemEp) itId)
+                    >> announce "Entry Deleted"
+                    >> pure InteractionEnd
+                )
+            ,
+                ( Option "Save entry"
+                , callApi ((vaultClient // itemsEp // editItemEp) itId item)
+                    >> announce "Changes saved"
+                    >> pure (editItemI et item)
+                )
             ]
 
     specificEditItemOptions :: [(Option, App Interaction)]
@@ -646,8 +651,8 @@ manageFoldersI =
 unlock :: Password -> App UnlockData
 unlock = mapReaderT (fmap coerce) . callApi . (vaultClient // lockingEp // unlockEp)
 
-logout :: App TitledData
-logout = mapReaderT (fmap coerce) $ callApi (vaultClient // lockingEp // lockEp)
+lock :: App TitledData
+lock = mapReaderT (fmap coerce) $ callApi (vaultClient // lockingEp // lockEp)
 
 sync :: App TitledData
 sync = mapReaderT (fmap coerce) $ callApi (vaultClient // miscEp // syncEp)
