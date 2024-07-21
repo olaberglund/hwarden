@@ -9,6 +9,7 @@ module Interaction (
     unlockI,
     interactionLoop,
     unlock,
+    announce,
 ) where
 
 import           Api

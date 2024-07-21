@@ -60,11 +60,9 @@ serverStatus = do
 actOnStatus :: MVar Password -> ServerStatus -> App ()
 actOnStatus mpw status = do
     env <- ask
-    log <- asks envLog
     case status of
         ServerOffline Undecided -> lift (errorExit "Weird status response from bitwarden")
         ServerOffline Unauthenticated -> do
-            log "ServerOffline, Unauthenticated: logging in"
             lift $
                 runReaderT
                     ( mapReaderT silently $ do
@@ -79,20 +77,17 @@ actOnStatus mpw status = do
                     )
                     env
         ServerOffline Authenticated -> do
-            log "ServerOffline, Authenticated: 2 threads: starting serve, acting on status"
             mstatus <- bwServe
             liftIO $ print mstatus
             case mstatus of
                 Just s  -> actOnStatus mpw s
-                Nothing -> lift (errorExit "Failed to start")
+                Nothing -> announce "Failed to start"
         ServerOnline Unlocked -> getItems >>= interactionLoop . dashboardI
         ServerOnline Locked -> do
-            log "ServerOnline, Locked: trying to unlock"
-            maybePw <- liftIO (tryTakeMVar mpw)
-            case maybePw of
+            mpw' <- liftIO (tryTakeMVar mpw)
+            case mpw' of
                 Just pw -> void (unlock pw)
                 Nothing -> mapReaderT silently $ do
-                    envLog env "Unlocking"
                     interactionLoop unlockI
 
             items <- getItems
