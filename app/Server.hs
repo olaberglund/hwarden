@@ -61,7 +61,7 @@ actOnStatus :: MVar Password -> ServerStatus -> App ()
 actOnStatus mpw status = do
     env <- ask
     case status of
-        ServerOffline Undecided -> lift (errorExit "Weird status response from bitwarden")
+        ServerOffline Undecided -> announce "Unexpected status response from bitwarden"
         ServerOffline Unauthenticated -> do
             lift $
                 runReaderT

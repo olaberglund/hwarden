@@ -19,6 +19,7 @@ import           Control.Monad.Trans.Reader (ReaderT, asks, mapReaderT)
 import           Data.Bifunctor             (Bifunctor (first), bimap)
 import           Data.Coerce                (Coercible, coerce)
 import           Data.Foldable              (for_)
+import           Data.Functor               ((<&>))
 import           Data.List                  (find)
 import           Data.Maybe                 (catMaybes, fromMaybe, isJust)
 import           Data.Text                  (Text)
@@ -434,22 +435,26 @@ editItemI et item@(ItemTemplate{..}) =
         Create ->
             [
                 ( Option "Save entry"
-                , callApi ((vaultClient // itemsEp // addItemEp) item)
-                    >> pure InteractionEnd
+                , do
+                    void $ callApi ((vaultClient // itemsEp // addItemEp) item)
+                    announce "Entry created"
+                    getItems <&> dashboardI
                 )
             ]
         Update ->
             [
                 ( Option "Delete entry"
-                , callApi ((vaultClient // itemsEp // deleteItemEp) itId)
-                    >> announce "Entry Deleted"
-                    >> pure InteractionEnd
+                , do
+                    void $ callApi ((vaultClient // itemsEp // deleteItemEp) itId)
+                    announce "Entry Deleted"
+                    getItems <&> dashboardI
                 )
             ,
                 ( Option "Save entry"
-                , callApi ((vaultClient // itemsEp // editItemEp) itId item)
-                    >> announce "Changes saved"
-                    >> pure (editItemI et item)
+                , do
+                    void $ callApi ((vaultClient // itemsEp // editItemEp) itId item)
+                    announce "Changes saved"
+                    pure (editItemI et item)
                 )
             ]
 

@@ -17,7 +17,7 @@ main = do
     baseUrl <- parseBaseUrl "http://localhost:8087"
     let env = mkClientEnv manager baseUrl
 
-    shelly $ verbosely $ runReaderT app (Env env (Menu dmenu) (lift . echo))
+    shelly $ runReaderT app (Env env (Menu dmenu) (lift . echo))
 
 app :: App ()
 app = do
