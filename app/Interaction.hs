@@ -10,10 +10,12 @@ module Interaction (
     interactionLoop,
     unlock,
     announce,
+    askQuestion,
 ) where
 
 import           Api
 import           Control.Monad              (replicateM_, void)
+import           Control.Monad.Free         (Free, foldFree, liftF)
 import           Control.Monad.Trans.Class  (lift)
 import           Control.Monad.Trans.Reader (ReaderT, asks, mapReaderT)
 import           Data.Bifunctor             (Bifunctor (first), bimap)
@@ -29,10 +31,10 @@ import           Item
 import           Menu
 import           Prelude                    hiding (log)
 import           Servant.Client             (ClientM, (//))
-import           Shelly                     (Sh, errorExit, exit, fromText,
-                                             get_env, liftIO, readfile, run_,
-                                             toTextIgnore, withTmpDir,
-                                             writefile, (<.>))
+import           Shelly                     (Sh, echo, errorExit, exit,
+                                             fromText, get_env, liftIO,
+                                             readfile, run_, toTextIgnore,
+                                             withTmpDir, writefile, (<.>))
 import           Text.Read                  (readMaybe)
 
 data Interaction = InteractionQuestion Question | InteractionEnd

@@ -65,6 +65,7 @@ executable hwarden
   other-modules:
     Api
     Env
+    FreeInteraction
     Interaction
     Item
     Menu
@@ -80,6 +81,7 @@ executable hwarden
     , base            ^>=4.18.2.1
     , bytestring
     , containers
+    , free
     , http-client
     , servant-client
     , servant-server

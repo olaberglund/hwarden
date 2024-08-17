@@ -1,6 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 
-module Server (actOnStatus, serverStatus) where
+module Server (actOnStatus, serverStatus, ServerStatus (..), AuthStatus (..), BwStatus (..)) where
 
 import           Api
 import           Control.Concurrent         (putMVar, threadDelay, tryTakeMVar)
