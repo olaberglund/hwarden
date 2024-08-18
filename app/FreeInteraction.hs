@@ -1,5 +1,6 @@
 {-# LANGUAGE LambdaCase        #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards   #-}
 
 module FreeInteraction (app', interpret) where
 
@@ -14,12 +15,15 @@ import           Control.Monad.Trans.Reader
 import           Data.Aeson                 (decode)
 import qualified Data.ByteString.Lazy       as BL
 import           Data.Coerce                (coerce)
-import           Data.Functor               ((<&>))
+import           Data.Foldable              (for_)
+import           Data.Functor               (($>), (<&>))
+import           Data.Maybe                 (fromMaybe)
 import           Data.Text                  (Text)
 import qualified Data.Text                  as Text
 import qualified Data.Text.Encoding         as T
 import           Env                        (App, Env (..))
-import           Interaction                (announce, getItems, unlock)
+import           Interaction                (announce, getItems, unlock,
+                                             withCacheFile)
 import           Item
 import           Menu
 import           Servant.Client             (ClientEnv, runClientM, (//))
@@ -40,6 +44,10 @@ data InteractionF next
     | GetItems ([ItemTemplate] -> next)
     | Announce Text next
     | Unlock Password next
+    | WriteCache Text next
+    | Paste Text next
+    | OpenInEditor Text (Text -> next)
+    | OpenInBrowser Uri next
     deriving (Functor)
 
 type Interaction' = Free InteractionF
@@ -92,8 +100,11 @@ getItems' = liftF $ GetItems id
 unlock' :: Password -> Interaction' ()
 unlock' = liftF . flip Unlock ()
 
-app' :: Free InteractionF ()
+app' :: Interaction' ()
 app' = getServerStatus >>= actOnStatus'
+
+writeCache' :: Text -> Interaction' ()
+writeCache' = liftF . flip WriteCache ()
 
 actOnStatus' :: ServerStatus -> Interaction' ()
 actOnStatus' = \case
@@ -123,6 +134,82 @@ actOnStatus' = \case
                 unlock' pw
                 actOnStatus' =<< getServerStatus
 
+paste :: Text -> Interaction' ()
+paste = liftF . flip Paste ()
+
+paste' :: Text -> Maybe Text -> (Text, Interaction' ())
+paste' k v = (k <> ": " <> fromMaybe "None" v, for_ v paste)
+
+openInEditor :: Text -> Interaction' Text
+openInEditor = liftF . flip OpenInEditor id
+
+openInBrowser :: Uri -> Interaction' ()
+openInBrowser = liftF . flip OpenInBrowser ()
+
+typeItem' :: ItemTemplate -> Interaction' ()
+typeItem' item = void $ askQuestionR "Entries" (typeItemOptions' item)
+
+allItems' :: (ItemTemplate -> Interaction' ()) -> [ItemTemplate] -> Interaction' ()
+allItems' interaction items = void (askQuestionR "Entries" continuations)
+  where
+    continuations :: [(Option, Interaction' ())]
+    continuations = (\t -> (Option (toEntry t), writeCache' (itId t) >> interaction t)) <$> items
+
+typeItemOptions' :: ItemTemplate -> [(Option, Interaction' ())]
+typeItemOptions' (ItemTemplate{..}) =
+    map (first Option) $
+        [ paste' "Name" (if Text.empty == itName then Nothing else Just itName)
+        , ("Folder: " <> fromMaybe "None" itFolderId, mapM_ paste itFolderId)
+        ,
+            ( "Notes: " <> maybe "None" (const "<Enter to view>") itNotes
+            , mapM_ openInEditor itNotes
+            )
+        ]
+            <> specificTypeItemOptions itItem
+  where
+    specificTypeItemOptions :: Item -> [(Text, Interaction' ())]
+    specificTypeItemOptions item =
+        case item of
+            ItemLogin Login{..} ->
+                [ ("Username: " <> fromMaybe "None" loginUsername, mapM_ paste loginUsername)
+                , ("Password: ********", mapM_ paste loginPassword)
+                , ("TOTP: " <> fromMaybe "None" loginTotp, pure ())
+                ]
+                    <> case fmap (zip [1 :: Int ..]) loginUris of
+                        Just uris ->
+                            [ ("URL" <> Text.pack (show i) <> ": " <> unUri url, openInBrowser url)
+                            | (i, url) <- uris
+                            ]
+                        Nothing -> []
+            ItemCard Card{..} ->
+                [ paste' "Cardholder Name" cardHolderName
+                , paste' "Number" cardNumber
+                , paste' "Expiration Month" cardExpMonth
+                , paste' "Expiration Year" cardExpYear
+                , paste' "Security Code" cardCode
+                ]
+            ItemIdentity Identity{..} ->
+                [ paste' "Title" identityTitle
+                , paste' "First Name" identityFirstName
+                , paste' "Middle Name" identityMiddleName
+                , paste' "Last Name" identityLastName
+                , paste' "Address 1" identityAddress1
+                , paste' "Address 2" identityAddress2
+                , paste' "Address 3" identityAddress3
+                , paste' "City" identityCity
+                , paste' "State" identityState
+                , paste' "Postal Code" identityPostalCode
+                , paste' "Country" identityCountry
+                , paste' "Company" identityCompany
+                , paste' "Email" identityEmail
+                , paste' "Phone" identityPhone
+                , paste' "SSN" identitySsn
+                , paste' "Username" identityUsername
+                , paste' "Passport Number" identityPassportNumber
+                , paste' "License Number" identityLicenseNumber
+                ]
+            ItemSecureNote _ -> []
+
 dashboard' :: [ItemTemplate] -> Interaction' ()
 dashboard' items = void $ askQuestionR "Entries" continuations
   where
@@ -130,10 +217,7 @@ dashboard' items = void $ askQuestionR "Entries" continuations
     continuations =
         map
             (first Option)
-            [
-                ( "View/type individual items"
-                , Pure ()
-                )
+            [ ("View/type individual items", allItems' typeItem' items)
             ,
                 ( "View previous entry"
                 , Pure ()
@@ -170,6 +254,18 @@ interpret = foldFree morph
         Announce msg next -> announce msg >> pure next
         Unlock pw next -> unlock pw >> pure next
         GetItems next -> next <$> getItems
+        WriteCache txt next -> lift (withCacheFile (`writefile` txt)) $> next
+        Paste text next -> lift (run_ "xdotool" ["type", "--delay", "0", text]) $> next
+        OpenInEditor text next -> lift $ do
+            editor <- get_env "EDITOR"
+            content <- case editor of
+                Nothing -> errorExit "EDITOR not set"
+                Just _e -> withTmpDir $ \fp -> do
+                    writefile (fp <.> "hwarden") text
+                    run_ "st" ["nano", toTextIgnore (fp <.> "hwarden")]
+                    readfile (fp <.> "hwarden")
+            pure (next content)
+        OpenInBrowser uri next -> lift (run_ "firefox" [unUri uri]) $> next
 
 pollServer :: ClientEnv -> IO ServerStatus
 pollServer client = do

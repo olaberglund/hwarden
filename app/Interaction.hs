@@ -11,6 +11,7 @@ module Interaction (
     unlock,
     announce,
     askQuestion,
+    withCacheFile,
 ) where
 
 import           Api
